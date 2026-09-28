@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
-import { existsSync, readFileSync } from "node:fs"
+import { appendFileSync, existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -12,6 +12,7 @@ const MODELS_TTL_MS = 10 * 60 * 1000
 export const RESPONSES_MODELS = new Set<string>([
   "grok-4.5",
   "grok-4.6",
+  "grok-4.7",
   "gpt-5.6-luna",
   "muse-spark-1.3-contributor",
   "muse-spark-1.2-contributor",
@@ -1151,6 +1152,112 @@ export function isParamError(status: number, text: string) {
   return /reasoning|thinking|effort|unknown (field|parameter)|unexpected|unsupported|invalid[ _-]?(request|param)|parameter|不支持|参数/i.test(text)
 }
 
+const DEEPSEEK_REASONING = new Map<string, Map<string, string>>()
+const MAX_REASONING_SESSIONS = 200
+
+function isDeepSeekModel(model: string) {
+  return /deepseek/i.test(model)
+}
+
+function reasoningCache(session: string) {
+  let cache = DEEPSEEK_REASONING.get(session)
+  if (!cache) {
+    if (DEEPSEEK_REASONING.size >= MAX_REASONING_SESSIONS) {
+      const oldest = DEEPSEEK_REASONING.keys().next().value
+      if (oldest !== undefined) DEEPSEEK_REASONING.delete(oldest)
+    }
+    cache = new Map()
+    DEEPSEEK_REASONING.set(session, cache)
+  }
+  return cache
+}
+
+export function injectReasoningContent(messages: any, session: string) {
+  if (!Array.isArray(messages)) return messages
+  const cache = DEEPSEEK_REASONING.get(session)
+  for (const message of messages) {
+    if (message?.role !== "assistant") continue
+    if (typeof message.reasoning_content === "string") continue
+    let text = ""
+    if (cache && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        const hit = call?.id ? cache.get(call.id) : undefined
+        if (hit) {
+          text = hit
+          break
+        }
+      }
+    }
+    message.reasoning_content = text
+  }
+  return messages
+}
+
+export function captureReasoningContent(session: string, message: any) {
+  if (!message) return
+  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : []
+  if (!calls.length) return
+  const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : ""
+  const cache = reasoningCache(session)
+  for (const call of calls) if (call?.id) cache.set(call.id, reasoning)
+}
+
+function reasoningCaptureStream(session: string) {
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let reasoning = ""
+  const ids: string[] = []
+  const flush = () => {
+    if (ids.length) {
+      const cache = reasoningCache(session)
+      for (const id of ids) cache.set(id, reasoning)
+    }
+    ids.length = 0
+    reasoning = ""
+  }
+  const inspect = (block: string) => {
+    for (const line of block.split("\n")) {
+      if (!line.startsWith("data:")) continue
+      const data = line.slice(5).trim()
+      if (data === "[DONE]") {
+        flush()
+        continue
+      }
+      let payload: any
+      try {
+        payload = JSON.parse(data)
+      } catch {
+        continue
+      }
+      const choice = payload?.choices?.[0]
+      const delta = choice?.delta
+      if (delta) {
+        if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content
+        if (Array.isArray(delta.tool_calls)) {
+          for (const call of delta.tool_calls) if (call?.id) ids.push(call.id)
+        }
+      }
+      if (choice?.finish_reason) flush()
+    }
+  }
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk)
+      buffer += decoder.decode(chunk, { stream: true })
+      let index = buffer.indexOf("\n\n")
+      while (index !== -1) {
+        inspect(buffer.slice(0, index))
+        buffer = buffer.slice(index + 2)
+        index = buffer.indexOf("\n\n")
+      }
+    },
+    flush() {
+      if (buffer.trim()) inspect(buffer)
+      flush()
+    },
+  })
+}
+
 async function sendOnce(
   upstream: Upstream,
   protocol: Protocol,
@@ -1158,6 +1265,7 @@ async function sendOnce(
   stream: boolean,
   model: string,
   headers: Record<string, string>,
+  session: string,
 ) {
   if (protocol === "openai") {
     const response = await fetch(`${upstream.baseURL}/chat/completions`, {
@@ -1167,7 +1275,15 @@ async function sendOnce(
     })
     if (!response.ok) return response
     if (stream && response.body) {
-      return new Response(response.body, { status: 200, headers: { ...SSE_HEADERS, ...CORS } })
+      const out = isDeepSeekModel(model) ? response.body.pipeThrough(reasoningCaptureStream(session)) : response.body
+      return new Response(out, { status: 200, headers: { ...SSE_HEADERS, ...CORS } })
+    }
+    if (isDeepSeekModel(model)) {
+      response
+        .clone()
+        .json()
+        .then((json) => captureReasoningContent(session, json?.choices?.[0]?.message))
+        .catch(() => {})
     }
     return response
   }
@@ -1205,26 +1321,64 @@ async function sendOnce(
   return jsonResponse(anthropicToChatResponse(await response.json(), model))
 }
 
+function debugLog(message: string) {
+  const file = process.env.OPENCODE_GO_DEBUG_LOG
+  if (!file) return
+  try {
+    appendFileSync(file, `${new Date().toISOString()} ${message}\n`)
+  } catch {
+    void 0
+  }
+}
+
+function summarizeBody(body: any) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  let images = 0
+  for (const message of messages) {
+    const content = message?.content
+    if (Array.isArray(content)) for (const part of content) if (part?.type === "image_url" || part?.type === "image") images += 1
+  }
+  const tools = Array.isArray(body?.tools) ? body.tools.length : 0
+  return `model=${body?.model} stream=${Boolean(body?.stream)} messages=${messages.length} images=${images} tools=${tools} bytes=${JSON.stringify(body ?? {}).length}`
+}
+
 async function runUpstream(upstream: Upstream, model: string, chatBody: any, stream: boolean, session: string) {
   const protocol = protocolFor(upstream, model)
   const headers = upstreamHeaders(upstream, session, protocol)
   const prepared = applyParamRules({ ...chatBody, model }, upstream, model)
+  if (protocol === "openai" && isDeepSeekModel(model)) injectReasoningContent(prepared.messages, session)
 
-  const response = await sendOnce(upstream, protocol, prepared, stream, model, headers)
-  if (response.ok) return response
+  debugLog(`--> ${upstream.id} ${protocol} ${summarizeBody(prepared)}`)
+  const response = await sendOnce(upstream, protocol, prepared, stream, model, headers, session)
+  if (response.ok) {
+    debugLog(`<-- ${response.status} ok`)
+    return response
+  }
 
-  const text = await response.text()
+  let failed = response
+  let text = await response.text()
+
+  if (protocol === "openai" && /not supported for format oa-compat|Endpoint is unavailable/i.test(text)) {
+    const alt = await sendOnce(upstream, "responses", prepared, stream, model, headers, session)
+    if (alt.ok) {
+      debugLog(`<-- ${alt.status} ok (responses fallback)`)
+      return alt
+    }
+    failed = alt
+    text = await alt.text()
+  }
+  debugLog(`<-- ${failed.status} ${text.slice(0, 4000)}`)
   if (upstream.paramFallback) {
     const { body: retryBody, changed } = stripReasoningParams(prepared)
-    if (changed && isParamError(response.status, text)) {
-      const retry = await sendOnce(upstream, protocol, retryBody, stream, model, headers)
+    if (changed && isParamError(failed.status, text)) {
+      const retry = await sendOnce(upstream, protocol, retryBody, stream, model, headers, session)
       if (retry.ok) return retry
       return relayError(retry)
     }
   }
   return new Response(text, {
-    status: response.status,
-    headers: { "content-type": response.headers.get("content-type") ?? "application/json", ...CORS },
+    status: failed.status,
+    headers: { "content-type": failed.headers.get("content-type") ?? "application/json", ...CORS },
   })
 }
 
@@ -1521,6 +1675,7 @@ export function createHandler(options: GatewayOptions = {}) {
 
       return errorResponse("Not found", 404, "not_found_error")
     } catch (error: any) {
+      debugLog(`!! handler error: ${error?.stack ?? error?.message ?? error}`)
       return errorResponse(error?.message ?? "Internal gateway error", 500, "api_error")
     }
   }
