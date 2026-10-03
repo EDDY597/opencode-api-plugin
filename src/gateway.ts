@@ -482,6 +482,9 @@ export function chatToAnthropic(json: any, model: string) {
   const choice = json.choices?.[0] ?? {}
   const message = choice.message ?? {}
   const content: any[] = []
+  if (typeof message.reasoning_content === "string" && message.reasoning_content) {
+    content.push({ type: "thinking", thinking: message.reasoning_content })
+  }
   if (message.content) content.push({ type: "text", text: message.content })
   for (const call of message.tool_calls ?? []) {
     let input: any = {}
@@ -566,6 +569,31 @@ export async function* chatStreamToAnthropic(
     const choice = payload.choices?.[0] ?? {}
     const delta = choice.delta ?? {}
     const frames: string[] = []
+
+    // Reasoning models (DeepSeek-style) stream thinking as `reasoning_content`;
+    // surface it as an Anthropic thinking block so thinking-capable clients can
+    // render it. `delta.reasoning` covers the OpenRouter-style variant.
+    const reasoningText = delta.reasoning_content ?? delta.reasoning
+    if (typeof reasoningText === "string" && reasoningText) {
+      const isNew = !indexByKey.has("thinking")
+      const index = openBlock("thinking", { type: "thinking" })
+      if (isNew) {
+        frames.push(
+          eventFrame("content_block_start", {
+            type: "content_block_start",
+            index,
+            content_block: { type: "thinking", thinking: "" },
+          }),
+        )
+      }
+      frames.push(
+        eventFrame("content_block_delta", {
+          type: "content_block_delta",
+          index,
+          delta: { type: "thinking_delta", thinking: reasoningText },
+        }),
+      )
+    }
 
     if (typeof delta.content === "string" && delta.content) {
       const isNew = !indexByKey.has("text")

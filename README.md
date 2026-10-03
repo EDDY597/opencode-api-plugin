@@ -162,6 +162,7 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 
 ## 工作原理补充
 
+- **思考内容桥接**：chat 上游的 `reasoning_content`（DeepSeek 风格，含 `reasoning` 变体）在 Anthropic 协议端点转换为 thinking 块（流式 `thinking_delta` / 非流式 thinking block），在 Responses 协议端点转换为 reasoning summary，让支持思考展示的客户端直接渲染。
 - **会话与推理缓存**：DeepSeek 类模型的 `reasoning_content` 按 `x-opencode-session` 会话缓存（LRU 200），并在后续请求中回注到 messages，保证多轮推理连续性。
 - **参数兼容回退**：上游对 `reasoning` / `thinking` / `effort` 等参数报 400/422 时（`paramFallback: true`），自动剥离全部推理类参数重试一次。
 
