@@ -16,10 +16,20 @@ if (!process.env.OPENCODE_GO_GATEWAY_TOKEN && fileConfig.token) {
   process.env.OPENCODE_GO_GATEWAY_TOKEN = String(fileConfig.token)
 }
 
-const { handler } = createHandler({})
+const { handler, upstreams } = createHandler({})
 const hostname = process.env.OPENCODE_GO_GATEWAY_HOST ?? "127.0.0.1"
 const parsedPort = Number(process.env.OPENCODE_GO_GATEWAY_PORT ?? 8787)
 const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8787
+
+const localUpstreams = upstreams.filter((upstream) => upstream.local)
+
+function shutdown(signal: string) {
+  console.log(`\n[Gateway] Received ${signal}, shutting down...`)
+  for (const upstream of localUpstreams) upstream.local?.killBackend()
+  server.close(() => process.exit(0))
+  // Fallback if connections keep the server open.
+  setTimeout(() => process.exit(0), 3000).unref()
+}
 
 const server = createServer(async (request, response) => {
   try {
@@ -62,4 +72,13 @@ server.on("error", (error: any) => {
 
 server.listen(port, hostname, () => {
   console.log(`OpenCode Go gateway listening on http://${hostname}:${port}/v1`)
+  for (const upstream of localUpstreams) {
+    upstream.local
+      ?.warmup()
+      .then(() => console.log(`[Gateway] Local OpenCode backend ready for upstream '${upstream.id}'`))
+      .catch((error: any) => console.error(`[Gateway] Local backend warmup failed for '${upstream.id}':`, error?.message))
+  }
 })
+
+process.on("SIGINT", () => shutdown("SIGINT"))
+process.on("SIGTERM", () => shutdown("SIGTERM"))

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { appendFileSync, existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { createLocalProxy, normalizeLocalProxyConfig, type LocalProxy } from "./opencode-local/local-proxy.ts"
 
 export const GO_BASE = "https://opencode.ai/zen/go/v1"
 export const VERSION = "0.1.0"
@@ -938,7 +939,7 @@ export type Protocol = "openai" | "anthropic" | "responses"
 export type UpstreamConfig = {
   id?: string
   name?: string
-  type?: Protocol | "opencode-go"
+  type?: Protocol | "opencode-go" | "opencode2api"
   prefix?: string
   baseURL?: string
   apiKey?: string
@@ -959,6 +960,23 @@ export type UpstreamConfig = {
   paramFallback?: boolean
   usageBase?: string
   usage?: boolean
+  // Embedded opencode2api upstream (type: "opencode2api")
+  opencodePath?: string
+  serverPassword?: string
+  manageBackend?: boolean
+  disableTools?: boolean
+  internalAllowedTools?: string[] | string
+  promptMode?: string
+  omitSystemPrompt?: boolean
+  zenApiKey?: string
+  useIsolatedHome?: boolean
+  requestTimeoutMs?: number
+  autoCleanupConversations?: boolean
+  cleanupIntervalMs?: number
+  cleanupMaxAgeMs?: number
+  debug?: boolean
+  eventIdleTimeoutMs?: number
+  eventFirstDeltaTimeoutMs?: number
 }
 
 type Upstream = {
@@ -982,6 +1000,7 @@ type Upstream = {
   paramFallback: boolean
   usageBase?: string
   presetOpenCodeGo: boolean
+  local?: LocalProxy
 }
 
 function trimSlash(value: string) {
@@ -1024,17 +1043,32 @@ export function buildUpstreams(config: any = {}): Upstream[] {
 
     const protocol: Protocol = raw.protocol ?? (type === "opencode-go" || type === "openai" ? "openai" : type)
 
+    // Embedded local proxy (opencode2api): speaks Chat Completions AND Responses
+    // natively for every model, so protocol routing is bypassed — chat/messages use
+    // the chat handler and /v1/responses dispatches directly.
+    const isLocal = type === "opencode2api"
+    const local = isLocal
+      ? createLocalProxy(
+          normalizeLocalProxyConfig({
+            ...raw,
+            id,
+            baseURL: baseURL || "http://127.0.0.1:10001",
+            toolLockPluginPath: join(import.meta.dirname, "..", "plugin", "opencode2api-tool-lock.js"),
+          }),
+        )
+      : undefined
+
     return {
       id,
       name: raw.name ?? (preset ? "OpenCode Go" : id),
       prefix,
-      baseURL,
+      baseURL: isLocal ? baseURL || "http://127.0.0.1:10001" : baseURL,
       apiKey: raw.apiKey,
       enabled: raw.enabled !== false,
-      protocol,
-      protocols,
-      responsesPrefixes: raw.responsesPrefixes ?? [],
-      anthropicPrefixes: raw.anthropicPrefixes ?? [],
+      protocol: isLocal ? "openai" : protocol,
+      protocols: isLocal ? new Map<string, Protocol>() : protocols,
+      responsesPrefixes: isLocal ? [] : (raw.responsesPrefixes ?? []),
+      anthropicPrefixes: isLocal ? [] : (raw.anthropicPrefixes ?? []),
       models,
       sessionHeader: raw.sessionHeader ?? preset,
       headers: raw.headers ?? {},
@@ -1052,6 +1086,7 @@ export function buildUpstreams(config: any = {}): Upstream[] {
               ? baseURL
               : undefined,
       presetOpenCodeGo: preset,
+      local,
     }
   })
 }
@@ -1080,6 +1115,13 @@ function protocolFor(upstream: Upstream, model: string): Protocol {
 }
 
 async function fetchUpstreamModels(upstream: Upstream) {
+  if (upstream.local) {
+    try {
+      return await upstream.local.listModels()
+    } catch {
+      return []
+    }
+  }
   if (upstream.models) return upstream.models
   try {
     const response = await fetch(`${upstream.baseURL}/models`, {
@@ -1267,6 +1309,11 @@ async function sendOnce(
   headers: Record<string, string>,
   session: string,
 ) {
+  if (upstream.local) {
+    const payload = { ...body }
+    if (protocol === "responses") return upstream.local.handleResponses(payload, stream)
+    return upstream.local.handleChat(payload, stream)
+  }
   if (protocol === "openai") {
     const response = await fetch(`${upstream.baseURL}/chat/completions`, {
       method: "POST",
@@ -1650,6 +1697,10 @@ export function createHandler(options: GatewayOptions = {}) {
         if (!body?.model) return errorResponse("Missing required field: model")
         const resolved = resolveModel(body.model, upstreams)
         if (!resolved) return errorResponse(`No enabled upstream for model ${body.model}`, 404, "model_not_found")
+        // Embedded local upstream speaks the Responses API natively for every model.
+        if (resolved.upstream.local) {
+          return await resolved.upstream.local.handleResponses({ ...body, model: resolved.model }, Boolean(body.stream))
+        }
         if (protocolFor(resolved.upstream, resolved.model) !== "responses") {
           return errorResponse(
             `Upstream ${resolved.upstream.id} does not speak the Responses API for ${resolved.model}; use /v1/chat/completions`,

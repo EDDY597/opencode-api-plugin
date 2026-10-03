@@ -2,23 +2,26 @@
 
 本地多协议 LLM 网关 —— 一个端点聚合多个上游，自动在 **Chat Completions / Anthropic Messages / Responses** 三种协议之间转换。
 
+内置 **opencode2api 嵌入式上游**：驱动本机 opencode 运行时，把 OpenCode Zen 免费模型变成网关的一个上游，单进程、零依赖、无需安装独立的 opencode2api 服务。
+
 零依赖（仅用 Node 内置模块，无需 `npm install`），Windows 友好（脚本启动 + 系统托盘）。
 
 ## 解决什么问题
 
 - 客户端各说各话：有的只发 OpenAI Chat Completions，有的只发 Anthropic Messages（如 Claude Code 类工具），有的用 Responses API。网关在入口做协议转换，任何客户端都能接任何上游。
-- 上游各说各话：OpenCode Go 官方端点、OpenCode Zen、本地代理（如 [opencode2api](https://github.com/TiaraBasori/opencode2api)）、第三方 OpenAI 兼容服务，统一聚合到 `http://127.0.0.1:8787/v1`。
+- 上游各说各话：OpenCode Go 官方端点、OpenCode Zen、嵌入式本地 opencode、第三方 OpenAI 兼容服务，统一聚合到 `http://127.0.0.1:8787/v1`。
 - 模型名冲突：不同上游可能有同名模型。用 `前缀/模型名` 路由，前缀自动剥离后转发。
 
 ```
 客户端（任意协议）
    │  /v1/chat/completions │ /v1/messages │ /v1/responses
    ▼
-网关 127.0.0.1:8787        ← 本项目
+网关 127.0.0.1:8787        ← 本项目（单进程）
    │  按模型名前缀路由 + 协议转换
    ├──► OpenCode Go（官方预设，读取本地 opencode 登录态）
    ├──► OpenCode Zen（官方 API，配 API Key）
-   └──► 任意 OpenAI 兼容上游（自定义 baseURL，如本地 opencode2api）
+   ├──► 嵌入式 opencode2api（type: "opencode2api"，自动拉起 opencode serve）
+   └──► 任意 OpenAI 兼容上游（自定义 baseURL）
 ```
 
 ## 环境要求
@@ -61,9 +64,9 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 | `type` | `opencode-go`（官方预设，自动读本地登录态与协议映射）或 `openai`（通用 OpenAI 兼容上游）；也可以直接把 type 写成 `anthropic` / `responses` 作为该上游的默认协议 |
 | `prefix` | 模型名前缀，如 `free`；匹配 `free/模型名` 的请求路由到此上游并剥离前缀 |
 | `baseURL` | 上游 API 根地址（**需含版本段**，如 `http://127.0.0.1:10000/v1`）；`opencode-go` 预设可省略 |
-| `apiKey` | 发给上游的密钥；`opencode-go` 预设可省略（自动读本地 opencode 凭据） |
-| `protocol` | 该上游的默认协议：`openai`（默认）/ `anthropic` / `responses` |
-| `responsesPrefixes` / `anthropicPrefixes` | 按模型名前缀强制指定协议，优先于 `protocol` |
+| `apiKey` | 发给上游的密钥；`opencode-go` 预设可省略（自动读本地 opencode 凭据）；嵌入式上游无需（由网关 `token` 统一鉴权） |
+| `protocol` | 该上游的默认协议：`openai`（默认）/ `anthropic` / `responses`；嵌入式上游固定 chat 且原生支持 Responses，无需设置 |
+| `responsesPrefixes` / `anthropicPrefixes` | 按模型名前缀强制指定协议，优先于 `protocol`（嵌入式上游忽略） |
 | `responsesModels` / `anthropicModels` / `protocols` | 按精确模型名指定协议（`protocols` 是 `模型名: 协议` 映射） |
 | `models` | 模型白名单（数组或对象），限制 `/v1/models` 聚合与可转发范围 |
 | `authHeader` | 上游鉴权方式：`bearer`（默认）/ `x-api-key` / `both` |
@@ -75,6 +78,25 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 | `paramFallback` | 默认 `true`：上游返回 400/422 且疑似不支持推理类参数时，剥离这些参数自动重试一次 |
 | `usageBase` / `usage` | `/api/usage` 额度聚合的上游地址；`usage: false` 排除该上游 |
 | `enabled` | 开关，默认 `true` |
+
+嵌入式上游（`type: "opencode2api"`）的附加字段：
+
+| 字段 | 默认 | 说明 |
+|:-----|:-----|:-----|
+| `baseURL` | `http://127.0.0.1:10001` | 本地 opencode 后端地址（网关自动拉起并托管） |
+| `opencodePath` | `opencode` | opencode 可执行文件路径（找不到时按 PATH 与常见安装位置自动搜索） |
+| `manageBackend` | `true` | 后端不在时自动 spawn `opencode serve`，随网关退出而关闭 |
+| `serverPassword` | (空) | 后端 Basic Auth 密码（经 `OPENCODE_SERVER_PASSWORD` 环境变量传给后端） |
+| `zenApiKey` | (空) | 透传为后端的 `OPENCODE_API_KEY`（解锁付费模型） |
+| `disableTools` | `true` | 禁用 OpenCode 内置工具（经 tool-lock 插件执行，免费档必需） |
+| `internalAllowedTools` | (空) | 内置工具白名单（逗号分隔或数组） |
+| `promptMode` | `standard` | `standard` 或 `plugin-inject` |
+| `omitSystemPrompt` | `false` | 忽略客户端传入的 system prompt |
+| `requestTimeoutMs` | `300000` | 单次请求超时（含上游重试） |
+| `useIsolatedHome` | `false` | Unix 下使用隔离 fake-home（Windows 恒用真实用户目录） |
+| `autoCleanupConversations` | `false` | 定期清理会话存储 |
+| `eventIdleTimeoutMs` / `eventFirstDeltaTimeoutMs` | `8000` / `30000` | 事件流空闲/首包超时 |
+| `debug` | `false` | 调试日志 |
 
 ## 模型命名与协议路由
 
@@ -102,28 +124,33 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/usage` | 聚合配置了 `usageBase` 的上游额度 |
 
-## 实战：聚合本地 opencode2api 免费模型
+## 实战：免费模型（嵌入式 opencode2api）
 
-[opencode2api](https://github.com/TiaraBasori/opencode2api) 把本机 opencode 运行时变成 OpenAI 兼容端点（免费模型），配合本网关即可让 **Anthropic 协议客户端**（Claude Code 类）也能用上这些模型：
+内置的嵌入式上游移植自 [opencode2api](https://github.com/TiaraBasori/opencode2api)（MIT，见 `plugin/` 内的许可副本）：驱动本机 opencode 运行时访问 OpenCode Zen 免费模型，无需单独安装或启动任何其他服务。前置条件只有一个——本机装有 opencode CLI（`npm install -g opencode-ai`），建议先 `opencode auth login` 登录免费账号（模型列表与限额都更好，匿名也能用）。
+
+`gateway.config.json`：
 
 ```json
 {
-  "id": "opencode2api",
-  "name": "Local Free (opencode2api)",
-  "type": "openai",
+  "id": "local-free",
+  "name": "OpenCode Local (embedded opencode2api)",
+  "type": "opencode2api",
   "prefix": "free",
-  "baseURL": "http://127.0.0.1:10000/v1",
-  "apiKey": "<opencode2api 的 API_KEY>",
-  "protocol": "openai",
-  "responsesPrefixes": ["opencode/"],
-  "paramFallback": true,
+  "baseURL": "http://127.0.0.1:10001",
+  "opencodePath": "opencode",
+  "manageBackend": true,
+  "disableTools": true,
+  "autoCleanupConversations": true,
   "enabled": true
 }
 ```
 
-- `responsesPrefixes: ["opencode/"]`：该上游所有模型（剥离前缀后均以 `opencode/` 开头）视为支持 Responses API。网关的 Chat/Anthropic 请求也会经 Responses 协议转换转发，实测全链路可用。
+- 首次请求后端会自动拉起（实例初始化约 10~20 秒，之后恢复毫秒级）；网关退出时自动关闭后端。
 - 客户端接入：地址 `http://127.0.0.1:8787/v1`，密钥为网关 `token`，模型名如 `free/opencode/space-bunny-free`。
-- 三种协议端点均已实测打通（含流式）；仅免费档模型可用，付费模型会由上游报 `Insufficient account funds`。
+- 三种协议端点 + 流式均已实测打通；仅免费档模型可用，付费模型会由上游报 `Insufficient account funds`。
+- 若后端无法访问 Zen，先确认本机代理环境变量（`HTTPS_PROXY` 等）指向的代理客户端正在运行，或将其清空走直连。
+
+也可改为传统部署：单独运行 opencode2api 服务，然后用 `type: "openai"` + `baseURL` 指向它，效果等同。
 
 ## 环境变量
 
@@ -146,5 +173,7 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 | 启动即报语法/加载错误 | Node 版本低于 22.6，无法原生运行 `.ts`。升级 Node 或改用高版本完整路径 |
 | 上游 401 | `apiKey` 与上游不匹配 |
 | 上游报 `Insufficient account funds` | 账号额度不足（如免费档调付费模型），与网关无关 |
-| `/v1/responses` 返回 501 | 目标模型未声明 responses 协议；给上游加 `responsesPrefixes` 或 `responsesModels` |
+| `/v1/responses` 返回 501 | 目标模型未声明 responses 协议；给上游加 `responsesPrefixes` 或 `responsesModels`（嵌入式上游无需，原生支持） |
 | `/v1/models` 为空或缺上游 | `baseURL` 需含版本段（以 `/v1` 结尾）；检查上游是否 `enabled` 且可达 |
+| 嵌入式上游首个请求很慢（10~20 秒） | opencode 实例首次初始化，属正常现象；之后恢复毫秒级 |
+| 嵌入式上游报 `Cannot connect to API` | 后端访问不了 Zen。检查 `HTTPS_PROXY` 等代理环境变量：代理客户端没跑就清空它们走直连，代理在跑就确认端口可达 |
