@@ -177,7 +177,7 @@ function Show-Settings {
   # local scope is gone, so function-locals would resolve to $null.
   $script:DlgForm = New-Object System.Windows.Forms.Form
   $script:DlgForm.Text = 'LLM Gateway 设置'
-  $script:DlgForm.Size = New-Object System.Drawing.Size(480, 250)
+  $script:DlgForm.ClientSize = New-Object System.Drawing.Size(464, 200)
   $script:DlgForm.FormBorderStyle = 'FixedDialog'
   $script:DlgForm.MaximizeBox = $false
   $script:DlgForm.StartPosition = 'CenterScreen'
@@ -211,37 +211,30 @@ function Show-Settings {
   $script:DlgPath.Text = [string]$script:DlgUp.opencodePath
   $script:DlgForm.Controls.Add($script:DlgPath)
 
-  $script:DlgDebug = New-Object System.Windows.Forms.CheckBox
-  $script:DlgDebug.Text = '调试日志'; $script:DlgDebug.AutoSize = $true
-  $script:DlgDebug.Location = New-Object System.Drawing.Point(12, 122)
-  $script:DlgDebug.Checked = ([string]$script:DlgUp.debug -eq 'true' -or $script:DlgUp.debug -eq $true)
-  $script:DlgForm.Controls.Add($script:DlgDebug)
-
   $lbHint = New-Object System.Windows.Forms.Label
   $lbHint.Text = '保存后自动重启网关使配置生效。'
-  $lbHint.Location = New-Object System.Drawing.Point(12, 150); $lbHint.AutoSize = $true
+  $lbHint.Location = New-Object System.Drawing.Point(12, 122); $lbHint.AutoSize = $true
   $lbHint.ForeColor = [System.Drawing.Color]::Gray
   $script:DlgForm.Controls.Add($lbHint)
 
-  $btnSave = New-Object System.Windows.Forms.Button
-  $btnSave.Text = '保存并重启'
-  $btnSave.Location = New-Object System.Drawing.Point(280, 180)
-  $btnSave.Size = New-Object System.Drawing.Size(110, 28)
-  $script:DlgForm.Controls.Add($btnSave)
-
   $btnCancel = New-Object System.Windows.Forms.Button
   $btnCancel.Text = '取消'
-  $btnCancel.Location = New-Object System.Drawing.Point(160, 180)
+  $btnCancel.Location = New-Object System.Drawing.Point(126, 158)
   $btnCancel.Size = New-Object System.Drawing.Size(90, 28)
   $btnCancel.DialogResult = 'Cancel'
   $script:DlgForm.Controls.Add($btnCancel)
+
+  $btnSave = New-Object System.Windows.Forms.Button
+  $btnSave.Text = '保存并重启'
+  $btnSave.Location = New-Object System.Drawing.Point(228, 158)
+  $btnSave.Size = New-Object System.Drawing.Size(110, 28)
+  $script:DlgForm.Controls.Add($btnSave)
 
   $btnSave.Add_Click({
       $key = $script:DlgKey.Text.Trim()
       $path = $script:DlgPath.Text.Trim()
       $script:DlgUp | Add-Member -NotePropertyName zenApiKey -NotePropertyValue $key -Force
       $script:DlgUp | Add-Member -NotePropertyName opencodePath -NotePropertyValue $(if ($path) { $path } else { 'opencode' }) -Force
-      $script:DlgUp | Add-Member -NotePropertyName debug -NotePropertyValue [bool]$script:DlgDebug.Checked -Force
 
       # Guard: PS 5.1 unwraps single-element arrays on ConvertFrom-Json.
       if ($script:DlgCfg.upstreams -isnot [array]) { $script:DlgCfg.upstreams = @($script:DlgCfg.upstreams) }
