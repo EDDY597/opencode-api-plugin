@@ -1075,12 +1075,17 @@ export function buildUpstreams(config: any = {}): Upstream[] {
     // natively for every model, so protocol routing is bypassed — chat/messages use
     // the chat handler and /v1/responses dispatches directly.
     const isLocal = type === "opencode2api"
+    // The OpenCode credential drives two side channels for the embedded upstream:
+    // OPENCODE_API_KEY for the spawned backend (paid models) and /usage quota
+    // queries for the tray. Falls back to the local opencode login state.
+    const localCredential = isLocal ? (raw.apiKey ?? raw.zenApiKey ?? readAuthKey()) : undefined
     const local = isLocal
       ? createLocalProxy(
           normalizeLocalProxyConfig({
             ...raw,
             id,
             baseURL: baseURL || "http://127.0.0.1:10001",
+            zenApiKey: raw.zenApiKey ?? readAuthKey(),
             toolLockPluginPath: join(import.meta.dirname, "..", "plugin", "opencode2api-tool-lock.js"),
           }),
         )
@@ -1091,7 +1096,7 @@ export function buildUpstreams(config: any = {}): Upstream[] {
       name: raw.name ?? (preset ? "OpenCode Go" : id),
       prefix,
       baseURL: isLocal ? baseURL || "http://127.0.0.1:10001" : baseURL,
-      apiKey: raw.apiKey,
+      apiKey: isLocal ? localCredential : raw.apiKey,
       enabled: raw.enabled !== false,
       protocol: isLocal ? "openai" : protocol,
       protocols: isLocal ? new Map<string, Protocol>() : protocols,
@@ -1112,7 +1117,9 @@ export function buildUpstreams(config: any = {}): Upstream[] {
             ? trimSlash(raw.usageBase)
             : preset
               ? baseURL
-              : undefined,
+              : isLocal
+                ? GO_BASE
+                : undefined,
       presetOpenCodeGo: preset,
       local,
     }
@@ -1545,7 +1552,19 @@ export async function readOpenCodeUsage(options: {
     throw new UsageError(`OpenCode API unreachable: ${error?.message ?? error}`, "VENDOR_API_UNREACHABLE")
   }
   if (!response.ok) {
-    throw new UsageError(`OpenCode API returned ${response.status}`, "VENDOR_API_UNREACHABLE", response.status)
+    let detail = ""
+    try {
+      const bodyText = await response.text()
+      const parsed = JSON.parse(bodyText)
+      detail = parsed?.error?.message ?? parsed?.message ?? ""
+    } catch {
+      void 0
+    }
+    throw new UsageError(
+      `OpenCode API returned ${response.status}${detail ? ": " + detail : ""}`,
+      "VENDOR_API_UNREACHABLE",
+      response.status,
+    )
   }
   let raw: unknown
   try {

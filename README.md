@@ -39,11 +39,26 @@ cp gateway.config.example.json gateway.config.json
 # 2. 启动
 start-gateway.cmd              # 前台窗口，可看日志
 start-gateway-hidden.vbs       # 静默后台运行
-tray.cmd                       # 另加一个系统托盘图标（悬停显示额度，右键刷新/退出）
+tray\tray.cmd                  # 托盘模式（推荐）：托盘启动并托管网关
 
 # 3. 验证
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 ```
+
+## 系统托盘
+
+`tray\tray.ps1`（经 `tray.cmd` / `tray-hidden.vbs` 启动）是网关的托盘管家，**图标存在 = 网关进程在运行**：
+
+- 启动时若网关未运行则自动拉起（隐藏窗口）；已运行则直接接管
+- 托盘**绿色**图标 = 网关健康；**灰色** = 启动中/异常
+- **悬停**显示 OpenCode 额度：5h / 周 / 月窗口的剩余百分比与重置时间（需 Go 订阅权益，未订阅显示对应提示）；每 60 秒刷新
+- **右键菜单**：
+  - **重启服务** —— 杀掉网关进程树并重新拉起（改完 gateway.config.json 后用它生效）
+  - **设置...** —— 弹窗编辑嵌入式上游的常用参数：OpenCode API Key（Zen 密钥，同时用于后端付费模型与额度查询）、opencode 可执行文件路径、调试日志开关；保存后自动重启生效
+  - **退出** —— 停止网关并关闭托盘
+- 网关进程退出（崩溃/被杀）时托盘弹出气泡提示并自动关闭，图标不会谎报状态
+
+注意：托盘与网关是同生关系——关托盘即停网关。想让网关脱离托盘常驻，用 `start-gateway-hidden.vbs` 启动即可（此时托盘只做监控与显示）。
 
 ## 配置参考
 
