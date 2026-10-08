@@ -1,0 +1,553 @@
+
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      lang="zh-CN"
+      xml:lang="zh-CN"
+      class="">
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=utf-8">
+<meta name="viewport" content="width=device-width">
+<title>登录 | 成都卡诺普机器人技术股份有限公司</title>
+
+
+<meta name="app_title" content="登录 | 成都卡诺普机器人技术股份有限公司">
+<meta name="app_base_path" content="">
+<base href="/">
+<meta name="current_user"
+      data-name="匿名"
+      data-logged-in="false"
+      data-id="3">
+
+
+<meta name="boards_demo_data_available" content="true">
+
+<meta name="csrf-param" content="authenticity_token" />
+<meta name="csrf-token" content="jqbJoKVaxrZGnINJCKRlkj8uwHRTg0-IqVEssn2DRVRoWwkCaGcdhd6vxVvZYVWg1fLITxZ2OEtaUserdIyupQ" />
+<meta name="csp-nonce" content="4M15san16b01wnOsHhF2Hw==" />
+<meta name="openproject_initializer" data-locale="zh-CN" data-defaultLocale="en" data-instanceLocale="zh-CN" data-firstWeekOfYear="4" data-firstDayOfWeek="0" data-environment="production" data-edition="standard" />
+
+<!-- global meta hooks before any scripts are loaded-->
+
+
+
+  <link rel="apple-touch-icon" type="image/png" href="/assets/apple-touch-icon-120x120-7cc127b22515cb03208e0cd2ab29c30545d6c1d232a8d68058c751bf29626354.png" sizes="120x120" />
+
+
+<script src="/assets/frontend/jquery.js" nonce="4M15san16b01wnOsHhF2Hw=="></script><script src="/assets/frontend/polyfills-2A2EJ5YK.js" nonce="4M15san16b01wnOsHhF2Hw==" type="module"></script><script src="/assets/frontend/main-7MJJJ5RG.js" nonce="4M15san16b01wnOsHhF2Hw==" type="module"></script><link rel="stylesheet" href="/assets/frontend/styles-IWX6VJW6.css" media="all" />
+
+<link rel="stylesheet" href="/highlighting/styles/f7c315396f4a15a2fd28b1a92a82acc5435bc3c39ced8dc32cf01011a3dcfc4a.css" media="all" />
+
+
+<style type="text/css">
+
+  .op-logo--link {
+    background-image: url(/custom_style/1762430333/logo/crobotp.png);
+  }
+
+  .op-logo--icon {
+    background-image: url(/assets/icon_logo-955af4346e973d13afd9f5a3d0d4c63f8002be1125bcd41d8036ff67ee1cdd51.svg);
+  }
+
+  .op-logo--icon_white {
+    background-image: url(/assets/icon_logo_white-8e3e74afd4629f3f6fed8e229bbc0dfd926fc196d8b8d0f7bf3be3eca9574fb7.svg);
+  }
+
+  .op-logo--link_high_contrast {
+    background-image: url(/assets/logo_openproject-0ac721deb10b0ac88e34c3a066dc8ce283e9d2601c805ae71fc8dc9548fc0582.png);
+  }
+</style>
+
+<style type="text/css">
+
+  /* Overwrite Primer primitives */
+  [data-color-mode] {
+      --body-background: var(--bgColor-default);
+      --body-font-color: var(--fgColor-default);
+  }
+  /* Override Primer variable to ensure compatibility with currently
+     configured design outside of high contrast mode  */
+  [data-color-mode][data-light-theme=light],
+  [data-color-mode][data-dark-theme=dark] {
+    --fgColor-accent: var(--accent-color) !important;
+    --fgColor-link: var(--accent-color) !important;
+    --control-checked-bgColor-rest: var(--control-checked-color) !important;
+    --control-checked-bgColor-active: var(--control-checked-color) !important;
+    --control-checked-bgColor-hover: var(--control-checked-color--major1) !important;
+    --controlKnob-borderColor-checked: var(--control-checked-color) !important;
+    --button-primary-fgColor-rest: var(--button--primary-font-color) !important;
+    --button-primary-bgColor-rest: var(--button--primary-background-color) !important;
+    --button-primary-bgColor-active: var(--button--primary-background-active-color) !important;
+    --button-primary-bgColor-hover: var(--button--primary-background-hover-color) !important;
+    --button-primary-bgColor-disabled: var(--button--primary-background-disabled-color) !important;
+    --button-primary-borderColor-disabled: var(--button--primary-border-disabled-color) !important;
+    --fc-page-bg-color: var(--body-background) !important;
+    --fc-list-event-hover-bg-color: var(--control-transparent-bgColor-hover) !important;
+  }
+
+  /* Generic color mapping for content variables */
+  [data-light-theme=light_high_contrast],
+  [data-dark-theme=dark],
+  [data-dark-theme=dark_high_contrast] {
+    --avatar-border-color: var(--avatar-borderColor);
+    --list-item-hover--border-color: var(--control-transparent-borderColor-hover);
+    --list-item-hover--color: var(--fgColor-default);
+    --ck-color-toolbar-border: var(--borderColor-default);
+    --ck-color-list-background: var(--overlay-bgColor);
+    --ck-color-base-border: var(--borderColor-default);
+    --ck-color-button-default-hover-background: var(--button-default-bgColor-hover);
+    --ck-color-toolbar-background: var(--body-background);
+    --ck-color-text: var(--body-font-color);
+    --ck-color-dropdown-panel-background: var(--overlay-bgColor);
+    --ck-color-list-button-hover-background: var(--control-transparent-bgColor-hover);
+    --ck-color-panel-background: var(--overlay-bgColor);
+    --ck-color-input-background: var(--overlay-bgColor);
+    --status-selector-border-color: var(--button-default-borderColor-rest);
+    --button--active-border-color: var(--button-default-borderColor-rest);
+    --button--font-color: var(--button-default-fgColor-rest);
+    --button--background-hover-color: var(--button-default-bgColor-hover);
+    --button--background-color: var(--button-default-bgColor-rest);
+    --header-border-bottom-width: 1px;
+    --header-bg-color: var(--bgColor-inset);
+    --header-item-font-color: var(--fgColor-default);
+    --header-item-font-hover-color: var(--fgColor-default);
+    --header-border-bottom-color: var(--borderColor-muted) !important;
+    --main-menu-bg-selected-background: var(--control-checked-borderColor-rest);
+    --main-menu-border-color: var(--borderColor-muted);
+    --main-menu-resizer-color: var(--borderColor-muted);
+    --main-menu-border-width: 1px;
+    --main-menu-font-color: var(--fgColor-default);
+    --main-menu-selected-font-color: var(--fgColor-default);
+    --main-menu-bg-color: var(--body-background);
+  }
+
+  /* For accessibility themes we are also overriding the header and the sidebar */
+  [data-light-theme=light_high_contrast],
+  [data-dark-theme=dark_high_contrast] {
+    --main-menu-hover-border-color: var(--fgColor-default) !important;
+    --main-menu-bg-selected-border: var(--fgColor-default);
+    --accent-color: var(--fgColor-accent);
+    --link-text-decoration: underline;
+    --button--primary-font-color: var(--button-primary-fgColor-rest);
+    --button--primary-background-hover-color: var(--button-primary-bgColor-hover);
+    --button--primary-background-color: var(--button-primary-bgColor-rest);
+    --primary-button-color: var(--button-primary-bgColor-rest);
+  }
+
+  /* For dark themes we are using a lighter version of the accent and primary color. Otherwise they will not be seen */
+  [data-dark-theme=dark],
+  [data-dark-theme=dark_high_contrast] {
+      --accent-color: var(--accent-color--dark-mode);
+      --content-icon-color: var(--accent-color--dark-mode);
+      --primary-button-color: var(--primary-button-color--dark-mode);
+      --button--primary-background-disabled-color: var(--primary-button-color--major1);
+      --button--primary-border-disabled-color: var(--primary-button-color--major1);
+      --type-form-conf-attribute--background: var(--overlay-bgColor);
+      --select-arrow-bg-color-url: url("data:image/svg+xml;utf8,<svg fill='white' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/><path d='M0 0h24v24H0z' fill='none'/></svg>");
+      --ck-color-mention-text: var(--display-red-fgColor);
+      --ck-color-button-on-background: var(--button-default-bgColor-active);
+      --ck-color-button-default-active-background: var(--button-default-bgColor-active);
+      --ck-color-button-on-hover-background: var(--button-default-bgColor-hover);
+      --ck-color-button-on-disabled-background: var(--button-default-bgColor-disabled);
+      --ck-color-labeled-field-label-background: var(--overlay-bgColor);
+      --ck-color-input-disabled-background: var(--bgColor-disabled);
+      --enterprise-upsell-text-color: var(--enterprise-upsell-color);
+  }
+
+  [data-dark-theme=dark_high_contrast] {
+    --avatar-borderColor: var(--borderColor-emphasis);
+    --content-icon-color: var(--fgColor-accent);
+    --button--primary-background-disabled-color: var(--button-primary-bgColor-disabled);
+    --button--primary-border-disabled-color: var(--button-primary-bgColor-disabled);
+  }
+</style>
+
+    
+<style type="text/css">
+    :root {
+        --header-bg-color: #05002C;
+      --header-item-font-color: #FFFFFF;
+        --main-menu-bg-color: #0E2045;
+      --main-menu-font-color: #FFFFFF;
+        --main-menu-border-width: 0px;
+        --main-menu-bg-selected-background: #3270DB;
+        --primary-button-color: #349939;
+        --primary-button-color--major1: #2b7d2f;
+        --primary-button-color--minor1: #d6ebd7;
+        --primary-button-color--minor2: #aed6b0;
+        --primary-button-color--dark-mode: #85c288;
+        --font-color-on-primary: #FFFFFF;
+        --accent-color: #275BB5;
+        --accent-color--major1: #1f4991;
+        --accent-color--major2: #17376d;
+        --accent-color--minor1: #d4def0;
+        --accent-color--minor2: #a9bde1;
+        --accent-color--dark-mode: #7d9dd3;
+    }
+
+</style>
+
+      <link rel="icon" type="image/png" href="/custom_style/1762430333/favicon/crobotp.ico" sizes="32x32">
+
+  <!-- project specific tags -->
+  
+
+  <!-- page specific tags -->
+  
+  <meta name="current_menu_item" content=""/>
+  <meta name="turbo-prefetch" content="false">
+</head>
+<body class="theme-core_design controller-account action-login ee-banners-hidden env-production bcf-deactivated  __overflowing_element_container __overflowing_body" data-controller="application auto-theme-switcher hover-card-trigger beforeunload external-links highlight-target-element" data-relative-url-root="/" data-overflowing-identifier=".__overflowing_body" data-rendered-at="2026-10-08T02:31:29Z" data-auto-theme-switcher-theme-value="light" data-auto-theme-switcher-desktop-light-high-contrast-logo-class="op-logo--link_high_contrast" data-auto-theme-switcher-mobile-white-logo-class="op-logo--icon_white" data-color-mode="light" data-light-theme="light">
+<div class="warning-bar--wrapper">
+  
+  
+  
+  
+</div>
+
+<noscript>
+  <div class="top-shelf">
+    <p>
+      <span>
+        <i class="icon3 icon-warning"  aria-hidden="true"></i>
+        <strong>JavaScript 被禁用</strong>
+      </span>
+      您需要激活JavaScript才能使用 OpenProject！
+      <a href="http://www.enable-javascript.com/" target="_blank">了解更多信息</a>
+    </p>
+  </div>
+</noscript>
+<opce-toasts-container></opce-toasts-container>
+<opce-modal-overlay></opce-modal-overlay>
+<live-region>
+  <div id="polite" aria-live="polite" aria-atomic="true" class="sr-only"></div>
+  <div id="assertive" aria-live="assertive" aria-atomic="true" class="sr-only"></div>
+</live-region>
+<span id="open-blank-target-link-description" class="sr-only">在新标签页打开链接</span>
+<opce-spot-drop-modal-portal></opce-spot-drop-modal-portal>
+<div id="wrapper" style="display:none" class="can-hide-navigation nosidebar">
+    <header class="op-app-header">
+      <div class="op-app-header--start">
+        <h1 class="sr-only">
+          顶部的菜单
+        </h1>
+        <a href="" class="sr-only skip-navigation-link"
+           id="skip-navigation--content"
+           aria-label="单击此处跳过菜单，转到内容">
+          跳到内容
+        </a>
+        <ul class="op-app-menu op-app-menu_drop-left"><button id="dialog-show-dialog-8c0aa19d-bb06-421d-8309-e603798b025d" data-show-dialog-id="dialog-8c0aa19d-bb06-421d-8309-e603798b025d" aria-controls="op-app-header--modules-menu-list" aria-labelledby="tooltip-598e430a-5984-4182-906a-69fa1bc316cc" type="button" data-view-component="true" class="Button Button--iconOnly Button--invisible Button--medium op-app-header--primer-button">  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-op-grid-menu Button-visual">
+    <path d="M1 12.4A1.4 1.4 0 0 1 2.4 11h1.2A1.4 1.4 0 0 1 5 12.4v1.2A1.4 1.4 0 0 1 3.6 15H2.4A1.4 1.4 0 0 1 1 13.6Zm1.4-.2a.2.2 0 0 0-.2.2v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2v-1.2a.2.2 0 0 0-.2-.2Zm0-6.2h1.2A1.4 1.4 0 0 1 5 7.4v1.2A1.4 1.4 0 0 1 3.6 10H2.4A1.4 1.4 0 0 1 1 8.6V7.4A1.4 1.4 0 0 1 2.4 6Zm-.2 1.4v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2V7.4a.2.2 0 0 0-.2-.2H2.4a.2.2 0 0 0-.2.2ZM2.4 1h1.2A1.4 1.4 0 0 1 5 2.4v1.2A1.4 1.4 0 0 1 3.6 5H2.4A1.4 1.4 0 0 1 1 3.6V2.4A1.4 1.4 0 0 1 2.4 1Zm-.2 1.4v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2V2.4a.2.2 0 0 0-.2-.2H2.4a.2.2 0 0 0-.2.2ZM7.4 1h1.2A1.4 1.4 0 0 1 10 2.4v1.2A1.4 1.4 0 0 1 8.6 5H7.4A1.4 1.4 0 0 1 6 3.6V2.4A1.4 1.4 0 0 1 7.4 1Zm-.2 1.4v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2V2.4a.2.2 0 0 0-.2-.2H7.4a.2.2 0 0 0-.2.2ZM6 7.4A1.4 1.4 0 0 1 7.4 6h1.2A1.4 1.4 0 0 1 10 7.4v1.2A1.4 1.4 0 0 1 8.6 10H7.4A1.4 1.4 0 0 1 6 8.6Zm1.4-.2a.2.2 0 0 0-.2.2v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2V7.4a.2.2 0 0 0-.2-.2Zm0 3.8h1.2a1.4 1.4 0 0 1 1.4 1.4v1.2A1.4 1.4 0 0 1 8.6 15H7.4A1.4 1.4 0 0 1 6 13.6v-1.2A1.4 1.4 0 0 1 7.4 11Zm-.2 1.4v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2v-1.2a.2.2 0 0 0-.2-.2H7.4a.2.2 0 0 0-.2.2Zm3.8-10A1.4 1.4 0 0 1 12.4 1h1.2A1.4 1.4 0 0 1 15 2.4v1.2A1.4 1.4 0 0 1 13.6 5h-1.2A1.4 1.4 0 0 1 11 3.6Zm1.4-.2a.2.2 0 0 0-.2.2v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2V2.4a.2.2 0 0 0-.2-.2Zm0 3.8h1.2A1.4 1.4 0 0 1 15 7.4v1.2a1.4 1.4 0 0 1-1.4 1.4h-1.2A1.4 1.4 0 0 1 11 8.6V7.4A1.4 1.4 0 0 1 12.4 6Zm-.2 1.4v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2V7.4a.2.2 0 0 0-.2-.2h-1.2a.2.2 0 0 0-.2.2Zm-1.2 5a1.4 1.4 0 0 1 1.4-1.4h1.2a1.4 1.4 0 0 1 1.4 1.4v1.2a1.4 1.4 0 0 1-1.4 1.4h-1.2a1.4 1.4 0 0 1-1.4-1.4Zm1.4-.2a.2.2 0 0 0-.2.2v1.2c0 .11.09.2.2.2h1.2a.2.2 0 0 0 .2-.2v-1.2a.2.2 0 0 0-.2-.2Z"></path>
+</svg>
+</button><tool-tip id="tooltip-598e430a-5984-4182-906a-69fa1bc316cc" for="dialog-show-dialog-8c0aa19d-bb06-421d-8309-e603798b025d" popover="manual" data-direction="s" data-type="label" data-view-component="true" class="sr-only position-absolute">全局模块</tool-tip>
+
+<dialog-helper>
+  <dialog id="dialog-8c0aa19d-bb06-421d-8309-e603798b025d" aria-modal="true" aria-labelledby="dialog-8c0aa19d-bb06-421d-8309-e603798b025d-title" aria-describedby="dialog-8c0aa19d-bb06-421d-8309-e603798b025d-description" data-view-component="true" class="Overlay Overlay-whenNarrow Overlay--size-small-portrait Overlay--motion-scaleFade Overlay--placement-left op-app-menu--item Overlay--disableScroll">
+    <div data-view-component="true" class="Overlay-header op-app-header--modules-menu-header">
+  <div class="Overlay-headerContentWrap">
+    <div class="Overlay-titleWrap">
+      <h1 class="Overlay-title sr-only" id="dialog-8c0aa19d-bb06-421d-8309-e603798b025d-title">
+        全局模块
+      </h1>
+        
+    </div>
+    <div class="Overlay-actionWrap">
+      <button data-close-dialog-id="dialog-8c0aa19d-bb06-421d-8309-e603798b025d" aria-label="Close" aria-label="Close" type="button" data-view-component="true" class="close-button Overlay-closeButton"><svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
+    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
+</svg></button>
+    </div>
+  </div>
+  
+</div>
+      <scrollable-region data-labelled-by="dialog-8c0aa19d-bb06-421d-8309-e603798b025d-title">
+        <div data-view-component="true" class="Overlay-body"><action-list>
+  <div data-view-component="true">
+    <ul id="op-app-header--modules-menu-list" role="list" data-view-component="true" class="op-app-menu--items ActionListWrap">
+        <li data-targets="action-list.items" data-view-component="true" class="ActionListItem">
+    
+    
+    <a id="item-75b452e1-282a-4f02-801f-66333f162215" href="/" data-view-component="true" class="ActionListContent ActionListContent--visual16">
+        <span class="ActionListItem-visual ActionListItem-visual--leading">
+          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-home">
+    <path d="M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z"></path>
+</svg>
+        </span>
+      
+        <span data-view-component="true" class="ActionListItem-label">
+          首页
+</span>      
+</a>
+  
+</li>
+</ul>    
+</div></action-list>
+</div>
+      </scrollable-region>
+      
+</dialog></dialog-helper>
+<div class="op-logo"><a data-auto-theme-switcher-target="desktopLogo" class="op-logo--link" href="https://op.crprobot.com/">首页</a></div></ul>
+      </div>
+      <div class="op-app-header--center">
+        <div class="op-app-search"><opce-global-search data-placeholder="&quot;在成都卡诺普机器人技术股份有限公司中搜索&quot;" class="op-angular-component"></opce-global-search></div>
+      </div>
+      <div class="op-app-header--end">
+        
+        <a href="https://wiki.crprobot.com/zh/openproject/home" accesskey="6" target="_blank" class="Button Button--iconOnly Button--invisible Button--medium op-app-header--primer-button hidden-for-mobile pl-1" id="icon-button-6c8344f1-e82a-40ca-ad5f-c0f2b37f7dd0" aria-labelledby="tooltip-9523cf25-7bb1-4e86-b30f-38fb633d1900" data-view-component="true">  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-question Button-visual">
+    <path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.92 6.085h.001a.749.749 0 1 1-1.342-.67c.169-.339.436-.701.849-.977C6.845 4.16 7.369 4 8 4a2.756 2.756 0 0 1 1.637.525c.503.377.863.965.863 1.725 0 .448-.115.83-.329 1.15-.205.307-.47.513-.692.662-.109.072-.22.138-.313.195l-.006.004a6.24 6.24 0 0 0-.26.16.952.952 0 0 0-.276.245.75.75 0 0 1-1.248-.832c.184-.264.42-.489.692-.661.103-.067.207-.132.313-.195l.007-.004c.1-.061.182-.11.258-.161a.969.969 0 0 0 .277-.245C8.96 6.514 9 6.427 9 6.25a.612.612 0 0 0-.262-.525A1.27 1.27 0 0 0 8 5.5c-.369 0-.595.09-.74.187a1.01 1.01 0 0 0-.34.398ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path>
+</svg>
+</a><tool-tip id="tooltip-9523cf25-7bb1-4e86-b30f-38fb633d1900" for="icon-button-6c8344f1-e82a-40ca-ad5f-c0f2b37f7dd0" popover="manual" data-direction="s" data-type="label" data-view-component="true" class="sr-only position-absolute">帮助</tool-tip>
+<button id="dialog-show-dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f" data-show-dialog-id="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f" type="button" data-view-component="true" class="op-app-header--primer-button op-app-menu--item Button--invisible Button--medium Button px-1">  <span class="Button-content">
+    <span class="Button-label">登录</span>
+      <span class="Button-visual Button-trailingVisual">
+          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-triangle-down">
+    <path d="m4.427 7.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.396 7H4.604a.25.25 0 0 0-.177.427Z"></path>
+</svg>
+      </span>
+  </span>
+</button>
+
+<dialog-helper>
+  <dialog id="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f" aria-modal="true" aria-labelledby="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f-title" aria-describedby="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f-description" data-view-component="true" class="Overlay Overlay-whenNarrow Overlay--size-medium Overlay--motion-scaleFade Overlay--placement-right Overlay--disableScroll">
+    <div data-view-component="true" class="Overlay-header op-app-header--modules-menu-header">
+  <div class="Overlay-headerContentWrap">
+    <div class="Overlay-titleWrap">
+      <h1 class="Overlay-title sr-only" id="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f-title">
+        用户菜单
+      </h1>
+        
+  <div data-view-component="true" class="flex-items-center d-flex flex-row">
+      <div data-view-component="true" class="mr-2"><svg aria-label="用户菜单" role="img" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-person">
+    <path d="M10.561 8.073a6.005 6.005 0 0 1 3.432 5.142.75.75 0 1 1-1.498.07 4.5 4.5 0 0 0-8.99 0 .75.75 0 0 1-1.498-.07 6.004 6.004 0 0 1 3.431-5.142 3.999 3.999 0 1 1 5.123 0ZM10.5 5a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"></path>
+</svg></div>
+      <div data-view-component="true" class="text-bold">登录</div>
+</div>
+
+    </div>
+    <div class="Overlay-actionWrap">
+      <button data-close-dialog-id="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f" aria-label="Close" aria-label="Close" type="button" data-view-component="true" class="close-button Overlay-closeButton"><svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
+    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
+</svg></button>
+    </div>
+  </div>
+  
+</div>
+      <scrollable-region data-labelled-by="dialog-02565b4f-376c-4b47-ae9f-64ff700dcb2f-title">
+        <div data-view-component="true" class="Overlay-body">
+<div id="nav-login-content">
+  <form autocomplete="off" class="-vertical form" action="/login" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="I4g0uzRExVelnf-O6ohyGTWClpsdifUIakpubaOd5xjeuV7p8mE5SolVnNKjZZ-D851JGzTN29i6-HmTA3ZOVA" autocomplete="off" />
+    <input type="hidden" name="back_url" id="back_url" value="https://op.crprobot.com/login" autocomplete="off" />
+
+    <div class="grid-block">
+      <div class="form--field -required">
+        <label class="form--label" title="用户名" for="username-pulldown">用户名</label>
+        <div class="form--field-container">
+          <span class="form--text-field-container"><input type="text" name="username" id="username-pulldown" autocapitalize="none" class="form--text-field" /></span>
+        </div>
+        <div class="form--field-extra-actions">
+            <label class="form--label-with-check-box -no-ellipsis">
+              <span class="form--check-box-container"><input type="checkbox" name="autologin" id="autologin-pulldown" value="1" class="form--check-box" /></span>
+              保持登录状态 7 天
+            </label>
+        </div>
+      </div>
+      <div class="form--field -required">
+        <label class="form--label" title="密码" for="password-pulldown">密码</label>
+        <div class="form--field-container">
+          <span class="form--text-field-container"><input type="password" name="password" id="password-pulldown" class="form--text-field -password" /></span>
+        </div>
+        <div class="form--field-extra-actions">
+        </div>
+      </div>
+    </div>
+    <div class="grid-block">
+      <div class="form--field">
+        <label class="form--label" for="login-pulldown">
+          &nbsp;
+        </label>
+        <input type="submit" name="login" id="login-pulldown"
+               value="登录" class="button -primary button_no-margin" tabindex="1">
+      </div>
+    </div>
+    
+</form></div>
+</div>
+      </scrollable-region>
+      
+</dialog></dialog-helper>
+
+      </div>
+    </header>
+  <div id="main"
+       class="can-hide-navigation nosidebar"
+       data-controller="menus--main-toggle">
+    <div class="content-overlay"
+         data-action="click->menus--main-toggle#toggleNavigation"></div>
+    <main id="content-wrapper" class="can-hide-navigation nosidebar">
+      <div id="primerized-flash-messages"
+     class="op-primer-flash"
+     data-controller="flash"
+     data-flash-autohide-value="true">
+  
+</div>
+
+
+
+      <div id="content" class="can-hide-navigation nosidebar ">
+        <h1 class="sr-only accessibility-helper">内容</h1>
+
+        <div id="content-body">
+          <button id="menu-toggle--expand-button" data-action="click-&gt;menus--main-toggle#toggleNavigation" aria-labelledby="tooltip-41850dfc-fd44-4cc4-9f4d-8ee19c79540f" type="button" data-view-component="true" class="Button Button--iconOnly Button--invisible Button--small">  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-sidebar-collapse Button-visual">
+    <path d="M6.823 7.823a.25.25 0 0 1 0 .354l-2.396 2.396A.25.25 0 0 1 4 10.396V5.604a.25.25 0 0 1 .427-.177Z"></path><path d="M1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25V1.75C0 .784.784 0 1.75 0ZM1.5 1.75v12.5c0 .138.112.25.25.25H9.5v-13H1.75a.25.25 0 0 0-.25.25ZM11 14.5h3.25a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25H11Z"></path>
+</svg>
+</button><tool-tip id="tooltip-41850dfc-fd44-4cc4-9f4d-8ee19c79540f" for="menu-toggle--expand-button" popover="manual" data-direction="s" data-type="label" data-view-component="true" class="sr-only position-absolute">展开项目菜单</tool-tip>
+
+
+          
+            
+
+
+
+
+<div id="login-form" class="form -bordered">
+  <h1>登录</h1>
+
+  <hr class="form--separator">
+    
+<form autocomplete="off" class="-wide-labels user-login--form form" data-turbo="false" action="/login" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="czdUl3ISFjiZxKVVLINRtvFogiOPzP_CrMw673nTawKOBj7FtDfqJbUMxgllbrwsN3ddo6aI0RJ8fi0R2TjCTg" autocomplete="off" />
+  
+
+  <div class="form--field -required">
+    <label class="form--label" title="用户名" for="username">用户名</label>
+    <div class="form--field-container">
+      <span class="form--text-field-container"><input type="text" name="username" id="username" autofocus="autofocus" autocapitalize="none" class="form--text-field" /></span>
+    </div>
+  </div>
+
+  <div class="form--field -required">
+    <label class="form--label" title="密码" for="password">密码</label>
+    <div class="form--field-container">
+      <span class="form--text-field-container"><input type="password" name="password" id="password" class="form--text-field -password" /></span>
+    </div>
+  </div>
+
+    <div class="form--field -no-label">
+      <div class="form--field-container">
+        <label class="form--label-with-check-box">
+          <span class="form--check-box-container"><input type="checkbox" name="autologin" id="autologin" value="1" class="form--check-box" /></span>
+          保持登录状态 7 天
+        </label>
+      </div>
+    </div>
+
+  <div class="login-form--footer">
+    <input type="submit" name="login" value="登录" class="button -primary button_no-margin" data-controller="disable-when-clicked" data-disable-when-clicked-text-value="正在加载..." data-disable-with="登录" />
+
+    <div class="login-options-container">
+      <div class="login-links">
+      </div>
+    </div>
+  </div>
+</form>
+<section data-augmented-model-wrapper
+         data-activation-selector=".registration-modal--activation-link"
+         data-modal-class-name="registration-modal -primary">
+  <div class="modal-delivery-element">
+  <form data-turbo="false" class="form -wide-labels spot-modal" id="new_user" action="/account/register" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="fKnhGKlzBZBzBxRnANbQCaPdEpUJ_VSmwY7GNejBpFh18t1ygtY1uJub1KczHOAhNnqmgecstzJycvLEPo53Yg" autocomplete="off" />
+    
+    
+    <div id="spotModalTitle" class="spot-modal--header">
+      欢迎使用 成都卡诺普机器人技术股份有限公司
+    </div>
+    <div class="spot-divider"></div>
+    <div class="spot-modal--body spot-container">
+      <h2>创建一个新帐户</h2>
+      <section class="form--section">
+          <div class="form--field -required -wide-label">
+              <label class="form--label" title="用户名" for="user_login">用户名</label><span class=" form--field-container"><span class="form--text-field-container"><input size="25" required="required" class="form--text-field" aria-required="true" type="text" value="" name="user[login]" id="user_login" /></span></span>
+          </div>
+        <div class="form--field -required -wide-label">
+          <label class="form--label" title="名字" for="user_firstname">名字</label><span class=" form--field-container"><span class="form--text-field-container"><input required="required" class="form--text-field" aria-required="true" type="text" value="" name="user[firstname]" id="user_firstname" /></span></span>
+        </div>
+        <div class="form--field -required -wide-label">
+          <label class="form--label" title="姓氏" for="user_lastname">姓氏</label><span class=" form--field-container"><span class="form--text-field-container"><input required="required" class="form--text-field" aria-required="true" type="text" value="" name="user[lastname]" id="user_lastname" /></span></span>
+        </div>
+          <div class="form--field -required -wide-label">
+            <label class="form--label" title="电子邮件" for="user_mail">电子邮件</label><span class=" form--field-container"><span class="form--text-field-container"><input required="required" class="form--text-field" aria-required="true" type="text" value="" name="user[mail]" id="user_mail" /></span></span>
+          </div>
+        
+        
+
+
+        <br>
+        <br>
+          <div class="form--field -required -wide-label -reduced-margin">
+            <label class="form--label" title="密码" for="user_password">密码</label><span class=" form--field-container"><span class="form--text-field-container"><input required="required" size="25" autocomplete="off" class="form--text-field -password" aria-required="true" type="password" name="user[password]" id="user_password" /></span></span>
+            <div class="form--field-instructions">
+              <em>必须至少为 10 个字符长。</em><br /><em>必须包含以下字符 (至少 4 中的 3 个)：大写字母 (如 'A'), 小写字母 （如 'a'), 特殊字符 (例如 ' %'), 数值 （例如 ' 1')。</em>
+            </div>
+          </div>
+          <div class="form--field -required -wide-label">
+            <label class="form--label" title="确认" for="user_password_confirmation">确认</label><span class=" form--field-container"><span class="form--text-field-container"><input required="required" size="25" autocomplete="off" class="form--text-field -password" aria-required="true" type="password" name="user[password_confirmation]" id="user_password_confirmation" /></span></span>
+          </div>
+      </section>
+      
+    </div>
+    <div class="spot-action-bar">
+  <div class="spot-action-bar--right">
+    <button name="button" type="submit" class="button_no-margin -primary -with-icon icon-checkmark spot-action-bar--action button">创建</button>
+  </div>
+</div>
+
+</form></div>
+
+</section>
+
+  
+</div>
+
+
+        </div>
+        <turbo-frame id="content-bodyRight">
+</turbo-frame></div></main>  </div>
+  <div id="ajax-indicator" style="display:none;"><span>正在加载...</span></div>
+</div>
+<script nonce="4M15san16b01wnOsHhF2Hw==" type="module">
+//<![CDATA[
+
+  // execute these lines to prevent flickering when page loads:
+  const wrapper = document.getElementById('wrapper');
+  const mainMenuCollapsed = window.OpenProject.guardedLocalStorage('openProject-mainMenuCollapsed');
+
+  let savedMainMenuWidth;
+  if (mainMenuCollapsed === 'true') {
+    savedMainMenuWidth = 0;
+  } else {
+    savedMainMenuWidth = parseInt(window.OpenProject.guardedLocalStorage('openProject-mainMenuWidth'), 10);
+  }
+
+  if (window.innerWidth < 1012) {
+    // force hide on load for small desktops
+    document.querySelector('.can-hide-navigation')?.classList.add('hidden-navigation');
+  }
+
+  if (savedMainMenuWidth >= 0) {
+    document.documentElement.style.setProperty('--main-menu-width', savedMainMenuWidth + 'px');
+  }
+
+  wrapper.style.display = '';
+
+//]]>
+</script>
+<script nonce="4M15san16b01wnOsHhF2Hw==">
+//<![CDATA[
+
+  (function($) {
+    // Wrapper for page-specific JS from deprecated inline functions
+    // no longer available with CSP.
+    
+  }(jQuery));
+
+//]]>
+</script><div class="op-wide-autocomplete-wrapper"></div>
+
+</body></html>
+

@@ -979,6 +979,9 @@ export type UpstreamConfig = {
   responsesPrefixes?: string[]
   anthropicPrefixes?: string[]
   models?: string[] | Record<string, unknown>
+  // Renames upstream model ids in /v1/models ({"upstream段/": "展示段/"}) and
+  // reverse-maps request model ids back before forwarding.
+  modelRewrite?: Record<string, string>
   sessionHeader?: boolean
   headers?: Record<string, string>
   authHeader?: "bearer" | "x-api-key" | "both" | "none"
@@ -1019,6 +1022,7 @@ type Upstream = {
   responsesPrefixes: string[]
   anthropicPrefixes: string[]
   models?: string[]
+  modelRewrite?: [string, string][]
   sessionHeader: boolean
   headers: Record<string, string>
   authHeader?: "bearer" | "x-api-key" | "both" | "none"
@@ -1069,6 +1073,12 @@ export function buildUpstreams(config: any = {}): Upstream[] {
     if (Array.isArray(raw.models)) models = raw.models
     else if (raw.models && typeof raw.models === "object") models = Object.keys(raw.models)
 
+    // Longest source prefix first so nested rewrites (e.g. "opencode-go/" vs
+    // "opencode/") resolve deterministically.
+    const modelRewrite = raw.modelRewrite
+      ? Object.entries(raw.modelRewrite).sort((a, b) => b[0].length - a[0].length) as [string, string][]
+      : undefined
+
     const protocol: Protocol = raw.protocol ?? (type === "opencode-go" || type === "openai" ? "openai" : type)
 
     // Embedded local proxy (opencode2api): speaks Chat Completions AND Responses
@@ -1103,6 +1113,7 @@ export function buildUpstreams(config: any = {}): Upstream[] {
       responsesPrefixes: isLocal ? [] : (raw.responsesPrefixes ?? []),
       anthropicPrefixes: isLocal ? [] : (raw.anthropicPrefixes ?? []),
       models,
+      modelRewrite,
       sessionHeader: raw.sessionHeader ?? preset,
       headers: raw.headers ?? {},
       authHeader: raw.authHeader,
@@ -1175,14 +1186,34 @@ async function fetchUpstreamModels(upstream: Upstream) {
   return upstream.presetOpenCodeGo ? FALLBACK_MODELS : []
 }
 
+/** Applies (or, with reverse, undoes) the upstream's modelRewrite map on a model id. */
+function rewriteModelId(upstream: Upstream, model: string, reverse = false) {
+  if (!upstream.modelRewrite) return model
+  for (const [from, to] of upstream.modelRewrite) {
+    const [src, dst] = reverse ? [to, from] : [from, to]
+    if (model.startsWith(src)) return dst + model.slice(src.length)
+  }
+  return model
+}
+
 function resolveModel(model: string, upstreams: Upstream[]) {
   const active = upstreams
     .filter((upstream) => upstream.enabled && upstream.baseURL)
     .sort((a, b) => b.prefix.length - a.prefix.length)
   for (const upstream of active) {
     if (upstream.prefix && model.startsWith(`${upstream.prefix}/`)) {
-      return { upstream, model: model.slice(upstream.prefix.length + 1) }
+      // The remainder may still carry display-side segments (modelRewrite);
+      // map them back to the upstream's own ids before forwarding.
+      return { upstream, model: rewriteModelId(upstream, model.slice(upstream.prefix.length + 1), true) }
     }
+  }
+  // An upstream may expose its own display segments as routing prefixes (empty
+  // prefix + modelRewrite): a request like "go/xxx" is reverse-mapped to the
+  // upstream's real model id.
+  for (const upstream of active) {
+    if (!upstream.modelRewrite) continue
+    const mapped = rewriteModelId(upstream, model, true)
+    if (mapped !== model) return { upstream, model: mapped }
   }
   const stripped = model.replace(/^opencode-go\//, "").replace(/^opencode\//, "")
   return active[0] ? { upstream: active[0], model: stripped } : undefined
@@ -1621,7 +1652,7 @@ export function createHandler(options: GatewayOptions = {}) {
         models = await fetchUpstreamModels(upstream)
         catalogCache.set(upstream.id, { at: Date.now(), models })
       }
-      groups.push({ name: upstream.name, prefix: upstream.prefix, models })
+      groups.push({ name: upstream.name, prefix: upstream.prefix, models: models.map((id) => rewriteModelId(upstream, id)) })
     }
     return groups
   }
@@ -1688,12 +1719,13 @@ export function createHandler(options: GatewayOptions = {}) {
         const data: any[] = []
         for (const group of groups) {
           for (const id of group.models) {
+            const fullId = group.prefix ? `${group.prefix}/${id}` : id
             data.push({
-              id: `${group.prefix}/${id}`,
+              id: fullId,
               object: "model",
               created: Math.floor(Date.now() / 1000),
-              owned_by: group.prefix,
-              name: `${group.prefix}/${id}`,
+              owned_by: group.prefix || id.split("/")[0] || "unknown",
+              name: fullId,
             })
           }
         }

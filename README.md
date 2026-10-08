@@ -84,6 +84,7 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 | `responsesPrefixes` / `anthropicPrefixes` | 按模型名前缀强制指定协议，优先于 `protocol`（嵌入式上游忽略） |
 | `responsesModels` / `anthropicModels` / `protocols` | 按精确模型名指定协议（`protocols` 是 `模型名: 协议` 映射） |
 | `models` | 模型白名单（数组或对象），限制 `/v1/models` 聚合与可转发范围 |
+| `modelRewrite` | 模型 id 改名映射（如 `{"opencode-go/": "go/"}`）：`/v1/models` 按映射改名展示，请求侧自动反向映射回上游真实 id；键取最长匹配 |
 | `authHeader` | 上游鉴权方式：`bearer`（默认）/ `x-api-key` / `both` |
 | `headers` | 附加到每个上游请求的自定义头 |
 | `sessionHeader` | `true` 时向上游透传 `x-opencode-session` 会话头 |
