@@ -481,6 +481,8 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
     "Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools."
   const EXTERNAL_TOOL_GUARD_MESSAGE =
     "OpenCode internal tools remain disabled. If an external tool contract is present, use only that contract and never call or mention OpenCode internal tools."
+  const EXTERNAL_TOOL_BRIDGE_ALLOW_MESSAGE =
+    "Client tools are still virtualized: call them only through the external <function_calls> contract. The built-in tools listed above are the only OpenCode internal tools you may call directly."
 
   const normalizeConfiguredToolNames = (entries: string[] = []) =>
     [...new Set(entries.map((entry) => String(entry || "").trim()).filter(Boolean))]
@@ -510,8 +512,10 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
     const parts: string[] = []
     if (!OMIT_SYSTEM_PROMPT && systemMsg && systemMsg.trim()) parts.push(systemMsg.trim())
     if (reasoningEffort && reasoningEffort !== "none") parts.push(`[Reasoning Effort: ${reasoningEffort}]`)
-    if (toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
-      parts.push(buildInternalAllowlistPrompt(internalAllowedTools))
+    const allowedInternal = normalizeConfiguredToolNames(internalAllowedTools)
+    if (allowedInternal.length > 0) {
+      parts.push(buildInternalAllowlistPrompt(allowedInternal))
+      if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE) parts.push(EXTERNAL_TOOL_BRIDGE_ALLOW_MESSAGE)
     } else if (DISABLE_TOOLS && PROMPT_MODE !== "plugin-inject") {
       parts.push(toolMode === TOOL_MODE.EXTERNAL_BRIDGE ? EXTERNAL_TOOL_GUARD_MESSAGE : TOOL_GUARD_MESSAGE)
     }
@@ -768,26 +772,21 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
   }
 
   const buildToolPolicy = (toolMode: ToolMode, internalContext: any = {}) => {
-    if (toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
-      const names = normalizeConfiguredToolNames(internalContext.allowedToolNames || SERVER_INTERNAL_ALLOWED_TOOL_NAMES)
-        .map(normalizeToolName)
-        .filter(Boolean)
-      return names.length ? [...new Set(names)].join(",") : "none"
-    }
+    const names = normalizeConfiguredToolNames(internalContext.allowedToolNames || SERVER_INTERNAL_ALLOWED_TOOL_NAMES)
+      .map(normalizeToolName)
+      .filter(Boolean)
+    if (names.length) return [...new Set(names)].join(",")
     return DISABLE_TOOLS ? "none" : "*"
   }
 
   const sessionTitleForPolicy = (policy: string) => `opencode2api [tools:${policy}]`
 
   const getToolOverridesForMode = async (toolMode: ToolMode, internalContext: any = {}) => {
-    if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE || toolMode === TOOL_MODE.DISABLED) {
-      return getDisabledToolOverrides()
-    }
-    if (toolMode !== TOOL_MODE.INTERNAL_ALLOWLIST) return null
+    const allowedNames = normalizeConfiguredToolNames(internalContext.allowedToolNames || SERVER_INTERNAL_ALLOWED_TOOL_NAMES)
+    if (allowedNames.length === 0) return getDisabledToolOverrides()
     const ids = await getBackendToolIds()
     if (!Array.isArray(ids) || ids.length === 0) return null
-    const resolution = resolveInternalAllowedToolIds(ids, internalContext.allowedToolNames || SERVER_INTERNAL_ALLOWED_TOOL_NAMES)
-    const { normalizedIds, normalizedAllowedNames, matchedToolIds } = resolution
+    const { normalizedIds, matchedToolIds } = resolveInternalAllowedToolIds(ids, allowedNames)
     if (matchedToolIds.length === 0) {
       internalToolMetrics.fallbackToDisabled += 1
       return buildDisabledToolOverrides(normalizedIds)
@@ -809,7 +808,7 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
   }
 
   const createSession = async (toolControl: { title?: string } | null) => {
-    const sessionRes = await client.sessionCreate(toolControl?.title ? { body: { title: toolControl.title } } : undefined)
+    const sessionRes = await client.sessionCreate(toolControl?.title ? { title: toolControl.title } : undefined)
     const sessionId = sessionRes?.data?.id
     if (!sessionId) throw new Error("Failed to create OpenCode session")
     return sessionId as string
@@ -1324,7 +1323,7 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
           await ensureBackendOnce()
 
           try {
-            await client.configUpdate({ body: { activeModel: { providerID: pID, modelID: mID } } })
+            await client.configUpdate({ activeModel: { providerID: pID, modelID: mID } })
           } catch (confError: any) {
             logDebug("Failed to set active model:", confError.message)
           }
@@ -1857,7 +1856,7 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
       await ensureBackendOnce()
 
       try {
-        await client.configUpdate({ body: { activeModel: { providerID: pID, modelID: mID } } })
+        await client.configUpdate({ activeModel: { providerID: pID, modelID: mID } })
       } catch {}
 
       const toolControl = await resolveToolControl(toolMode, internalToolContext)

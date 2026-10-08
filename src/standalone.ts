@@ -55,6 +55,14 @@ const server = createServer(async (request, response) => {
     }
     response.end()
   } catch (error: any) {
+    // A streaming upstream can drop after headers are already flushed. Setting
+    // the status then throws ERR_HTTP_HEADERS_SENT, which — inside this async
+    // callback — becomes an unhandled rejection and kills the process. Tear the
+    // socket down instead so the gateway survives.
+    if (response.headersSent) {
+      response.destroy(error instanceof Error ? error : undefined)
+      return
+    }
     response.statusCode = 500
     response.setHeader("content-type", "application/json")
     response.end(JSON.stringify({ error: { message: error?.message ?? "server error" } }))
@@ -82,3 +90,12 @@ server.listen(port, hostname, () => {
 
 process.on("SIGINT", () => shutdown("SIGINT"))
 process.on("SIGTERM", () => shutdown("SIGTERM"))
+
+// Keep the gateway alive on stray async errors instead of dying silently and
+// taking the tray down with it (which makes clients reconnect in a loop).
+process.on("unhandledRejection", (reason) => {
+  console.error("[Gateway] Unhandled rejection:", reason)
+})
+process.on("uncaughtException", (error) => {
+  console.error("[Gateway] Uncaught exception:", error)
+})
