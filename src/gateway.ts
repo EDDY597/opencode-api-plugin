@@ -10,6 +10,15 @@ const USER_AGENT = `opencode-go-gateway/${VERSION}`
 const DEFAULT_PORT = 8787
 const MODELS_TTL_MS = 10 * 60 * 1000
 
+// Upstream resilience defaults: retries absorb transient failures (429/5xx/
+// transport drops) with an exponential backoff; the timeout caps only the
+// time-to-first-byte so a slow stream is never cut mid-flight.
+const DEFAULT_RETRY_ATTEMPTS = 3
+const DEFAULT_RETRY_MAX_DELAY_MS = 20_000
+const DEFAULT_TTFB_TIMEOUT_MS = 120_000
+const RETRY_INITIAL_DELAY_MS = 500
+const RETRY_JITTER_RATIO = 0.1
+
 export const RESPONSES_MODELS = new Set<string>([
   "grok-4.5",
   "grok-4.6",
@@ -478,6 +487,71 @@ function mapStopReason(finish: string | null | undefined) {
   return "end_turn"
 }
 
+// Boundary tags are built by concatenation so no tool pipeline can strip the
+// angle brackets out of the literals.
+export const THINK_OPEN = "<" + "think" + ">"
+export const THINK_CLOSE = "<" + "/think" + ">"
+
+type ThinkSegment = { kind: "text" | "reasoning"; text: string }
+
+/**
+ * Incremental splitter for models that emit thinking inline as
+ * `charted…` inside `content` (some OpenCode Go routes do). Feed it
+ * content deltas; it yields text/reasoning segments and holds back any
+ * suffix that could still grow into a boundary tag, so a tag split across
+ * two deltas is never leaked as literal text.
+ */
+export class ThinkTagExtractor {
+  private pending = ""
+  private state: "text" | "reasoning" = "text"
+
+  /** Consume one content delta; emit the segments it completes. */
+  feed(input: string): ThinkSegment[] {
+    this.pending += input
+    const out: ThinkSegment[] = []
+    for (;;) {
+      const tag = this.state === "text" ? THINK_OPEN : THINK_CLOSE
+      const at = this.pending.indexOf(tag)
+      if (at === -1) {
+        let keep = 0
+        for (let length = Math.min(tag.length - 1, this.pending.length); length > 0; length--) {
+          if (tag.startsWith(this.pending.slice(this.pending.length - length))) {
+            keep = length
+            break
+          }
+        }
+        const emit = this.pending.slice(0, this.pending.length - keep)
+        if (emit.length > 0) out.push({ kind: this.state, text: emit })
+        this.pending = this.pending.slice(this.pending.length - keep)
+        return out
+      }
+      if (at > 0) out.push({ kind: this.state, text: this.pending.slice(0, at) })
+      this.state = this.state === "text" ? "reasoning" : "text"
+      this.pending = this.pending.slice(at + tag.length)
+    }
+  }
+
+  /** Emit whatever remains when the stream ends; an unclosed think stays reasoning. */
+  flush(): ThinkSegment[] {
+    const out: ThinkSegment[] = this.pending.length > 0 ? [{ kind: this.state, text: this.pending }] : []
+    this.pending = ""
+    return out
+  }
+}
+
+/** Split a complete content string once; undefined when it has no inline think tag. */
+function splitInlineThinking(content: string): { text: string; thinking: string } | undefined {
+  if (!content.includes(THINK_OPEN)) return undefined
+  const extractor = new ThinkTagExtractor()
+  let text = ""
+  let thinking = ""
+  for (const segment of [...extractor.feed(content), ...extractor.flush()]) {
+    if (segment.kind === "reasoning") thinking += segment.text
+    else text += segment.text
+  }
+  return { text, thinking }
+}
+
 export function chatToAnthropic(json: any, model: string) {
   const choice = json.choices?.[0] ?? {}
   const message = choice.message ?? {}
@@ -485,7 +559,13 @@ export function chatToAnthropic(json: any, model: string) {
   if (typeof message.reasoning_content === "string" && message.reasoning_content) {
     content.push({ type: "thinking", thinking: message.reasoning_content })
   }
-  if (message.content) content.push({ type: "text", text: message.content })
+  const split = typeof message.content === "string" ? splitInlineThinking(message.content) : undefined
+  if (split) {
+    if (split.thinking) content.push({ type: "thinking", thinking: split.thinking })
+    if (split.text) content.push({ type: "text", text: split.text })
+  } else if (message.content) {
+    content.push({ type: "text", text: message.content })
+  }
   for (const call of message.tool_calls ?? []) {
     let input: any = {}
     try {
@@ -551,6 +631,56 @@ export async function* chatStreamToAnthropic(
     return order.map((entry) => eventFrame("content_block_stop", { type: "content_block_stop", index: entry.index }))
   }
 
+  // Some upstreams stream thinking inline as `charted…` inside content;
+  // the extractor lifts it into the thinking block like reasoning_content.
+  const think = new ThinkTagExtractor()
+  const emitSegment = (frames: string[], segment: ThinkSegment) => {
+    if (segment.kind === "reasoning") emitThinking(frames, segment.text)
+    else emitText(frames, segment.text)
+  }
+
+  const emitThinking = (frames: string[], reasoningText: string) => {
+    const isNew = !indexByKey.has("thinking")
+    const index = openBlock("thinking", { type: "thinking" })
+    if (isNew) {
+      frames.push(
+        eventFrame("content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: { type: "thinking", thinking: "" },
+        }),
+      )
+    }
+    frames.push(
+      eventFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "thinking_delta", thinking: reasoningText },
+      }),
+    )
+  }
+
+  const emitText = (frames: string[], text: string) => {
+    const isNew = !indexByKey.has("text")
+    const index = openBlock("text", { type: "text" })
+    if (isNew) {
+      frames.push(
+        eventFrame("content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: { type: "text", text: "" },
+        }),
+      )
+    }
+    frames.push(
+      eventFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "text_delta", text },
+      }),
+    )
+  }
+
   for await (const ev of sseEvents(stream)) {
     if (!ev.data || ev.data === "[DONE]") continue
     let payload: any
@@ -574,46 +704,10 @@ export async function* chatStreamToAnthropic(
     // surface it as an Anthropic thinking block so thinking-capable clients can
     // render it. `delta.reasoning` covers the OpenRouter-style variant.
     const reasoningText = delta.reasoning_content ?? delta.reasoning
-    if (typeof reasoningText === "string" && reasoningText) {
-      const isNew = !indexByKey.has("thinking")
-      const index = openBlock("thinking", { type: "thinking" })
-      if (isNew) {
-        frames.push(
-          eventFrame("content_block_start", {
-            type: "content_block_start",
-            index,
-            content_block: { type: "thinking", thinking: "" },
-          }),
-        )
-      }
-      frames.push(
-        eventFrame("content_block_delta", {
-          type: "content_block_delta",
-          index,
-          delta: { type: "thinking_delta", thinking: reasoningText },
-        }),
-      )
-    }
+    if (typeof reasoningText === "string" && reasoningText) emitThinking(frames, reasoningText)
 
     if (typeof delta.content === "string" && delta.content) {
-      const isNew = !indexByKey.has("text")
-      const index = openBlock("text", { type: "text" })
-      if (isNew) {
-        frames.push(
-          eventFrame("content_block_start", {
-            type: "content_block_start",
-            index,
-            content_block: { type: "text", text: "" },
-          }),
-        )
-      }
-      frames.push(
-        eventFrame("content_block_delta", {
-          type: "content_block_delta",
-          index,
-          delta: { type: "text_delta", text: delta.content },
-        }),
-      )
+      for (const segment of think.feed(delta.content)) emitSegment(frames, segment)
     }
 
     if (Array.isArray(delta.tool_calls)) {
@@ -645,22 +739,47 @@ export async function* chatStreamToAnthropic(
     let finished = false
     if (choice.finish_reason) {
       stopReason = mapStopReason(choice.finish_reason)
-      frames.push(...closeAll())
-      frames.push(
-        eventFrame("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: outputTokens },
-        }),
-      )
-      frames.push(eventFrame("message_stop", { type: "message_stop" }))
+      // Flush the extractor first so a held-back tag suffix still lands
+      // inside an open block before it is closed.
+      for (const segment of think.flush()) emitSegment(frames, segment)
       finished = true
+      if (!indexByKey.size) {
+        // Nothing was ever streamed: a successful empty message would just
+        // confuse agents, so end with a protocol-level error they can retry.
+        frames.push(
+          eventFrame("error", {
+            type: "error",
+            error: { type: "api_error", message: "Upstream returned an empty response", code: "EMPTY_RESPONSE" },
+          }),
+        )
+      } else {
+        frames.push(...closeAll())
+        frames.push(
+          eventFrame("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: { output_tokens: outputTokens },
+          }),
+        )
+        frames.push(eventFrame("message_stop", { type: "message_stop" }))
+      }
     }
 
     for (const f of frames) yield f
     if (finished) return
   }
 
+  const tail: string[] = []
+  for (const segment of think.flush()) emitSegment(tail, segment)
+  yield* tail
+  if (!indexByKey.size) {
+    // Upstream closed without ever streaming anything.
+    yield eventFrame("error", {
+      type: "error",
+      error: { type: "api_error", message: "Upstream returned an empty response", code: "EMPTY_RESPONSE" },
+    })
+    return
+  }
   yield* closeAll()
   yield eventFrame("message_delta", {
     type: "message_delta",
@@ -867,7 +986,16 @@ export async function* anthropicStreamToChat(
     } else if (payload.type === "message_stop") {
       if (usage) usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
       for (const f of frames) yield f
-      yield makeChunk({}, finishReason)
+      yield frame(
+        JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason, logprobs: null }],
+          ...(usage ? { usage } : {}),
+        }),
+      )
       yield frame("[DONE]")
       return
     } else if (payload.type === "error") {
@@ -880,7 +1008,16 @@ export async function* anthropicStreamToChat(
   }
 
   if (usage) usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
-  yield makeChunk({}, finishReason)
+  yield frame(
+    JSON.stringify({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason, logprobs: null }],
+      ...(usage ? { usage } : {}),
+    }),
+  )
   yield frame("[DONE]")
 }
 
@@ -989,6 +1126,13 @@ export type UpstreamConfig = {
   modelParams?: Record<string, Record<string, unknown>>
   reasoningEffortMap?: Record<string, string>
   paramFallback?: boolean
+  // Retry transient upstream failures (429/5xx/transport): `attempts` counts
+  // total tries, delays double from 500ms up to `maxDelayMs` (+/- jitter),
+  // honoring Retry-After. AUTH/invalid-request failures are never retried.
+  retry?: { attempts?: number; maxDelayMs?: number }
+  // Time-to-first-byte cap: headers must arrive within this or the attempt
+  // fails as TIMEOUT (retryable). Does not limit a started stream. 0 disables.
+  timeoutMs?: number
   usageBase?: string
   usage?: boolean
   // Embedded opencode2api upstream (type: "opencode2api")
@@ -1030,6 +1174,9 @@ type Upstream = {
   modelParams: Record<string, Record<string, unknown>>
   reasoningEffortMap: Record<string, string>
   paramFallback: boolean
+  retryAttempts: number
+  retryMaxDelayMs: number
+  timeoutMs: number
   usageBase?: string
   presetOpenCodeGo: boolean
   local?: LocalProxy
@@ -1121,6 +1268,9 @@ export function buildUpstreams(config: any = {}): Upstream[] {
       modelParams: raw.modelParams ?? {},
       reasoningEffortMap: raw.reasoningEffortMap ?? {},
       paramFallback: raw.paramFallback !== false,
+      retryAttempts: Math.max(1, raw.retry?.attempts ?? DEFAULT_RETRY_ATTEMPTS),
+      retryMaxDelayMs: Math.max(0, raw.retry?.maxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS),
+      timeoutMs: Math.max(0, raw.timeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS),
       usageBase:
         raw.usage === false
           ? undefined
@@ -1381,11 +1531,11 @@ async function sendOnce(
     return upstream.local.handleChat(payload, stream)
   }
   if (protocol === "openai") {
-    const response = await fetch(`${upstream.baseURL}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    })
+    const response = await fetchWithTtfbTimeout(
+      `${upstream.baseURL}/chat/completions`,
+      { method: "POST", headers, body: JSON.stringify(body) },
+      upstream.timeoutMs,
+    )
     if (!response.ok) return response
     if (stream && response.body) {
       const out = isDeepSeekModel(model) ? response.body.pipeThrough(reasoningCaptureStream(session)) : response.body
@@ -1402,11 +1552,11 @@ async function sendOnce(
   }
 
   if (protocol === "responses") {
-    const response = await fetch(`${upstream.baseURL}/responses`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(chatToResponses(body)),
-    })
+    const response = await fetchWithTtfbTimeout(
+      `${upstream.baseURL}/responses`,
+      { method: "POST", headers, body: JSON.stringify(chatToResponses(body)) },
+      upstream.timeoutMs,
+    )
     if (!response.ok) return response
     if (stream) {
       if (!response.body) return errorResponse("Upstream returned no body", 502)
@@ -1418,11 +1568,11 @@ async function sendOnce(
     return jsonResponse(responsesToChat(await response.json(), model))
   }
 
-  const response = await fetch(`${upstream.baseURL}/messages`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(chatToAnthropicRequest(body)),
-  })
+  const response = await fetchWithTtfbTimeout(
+    `${upstream.baseURL}/messages`,
+    { method: "POST", headers, body: JSON.stringify(chatToAnthropicRequest(body)) },
+    upstream.timeoutMs,
+  )
   if (!response.ok) return response
   if (stream) {
     if (!response.body) return errorResponse("Upstream returned no body", 502)
@@ -1455,44 +1605,178 @@ function summarizeBody(body: any) {
   return `model=${body?.model} stream=${Boolean(body?.stream)} messages=${messages.length} images=${images} tools=${tools} bytes=${JSON.stringify(body ?? {}).length}`
 }
 
+type FailureCode = "RATE_LIMIT" | "SERVER" | "TIMEOUT" | "TRANSPORT" | "EMPTY_RESPONSE"
+
+/** Transient upstream failures worth a retry; everything else fails fast. */
+function classifyFailure(status: number): FailureCode | undefined {
+  if (status === 408) return "TIMEOUT"
+  if (status === 429) return "RATE_LIMIT"
+  if (status >= 500) return "SERVER" // includes 529 (Anthropic-style overloaded)
+  return undefined
+}
+
+/** Honor Retry-After when present, clamped to the configured delay ceiling. */
+function retryAfterMs(headers: Headers | undefined, maxDelayMs: number): number | undefined {
+  const raw = headers?.get("retry-after")
+  if (!raw) return undefined
+  const seconds = Number(raw)
+  let delay: number
+  if (raw.trim() !== "" && Number.isFinite(seconds)) delay = seconds * 1000
+  else {
+    const date = Date.parse(raw)
+    if (Number.isNaN(date)) return undefined
+    delay = date - Date.now()
+  }
+  if (delay < 0) return undefined
+  return Math.min(delay, maxDelayMs)
+}
+
+/** Exponential backoff rung with symmetric jitter, capped at maxDelayMs. */
+function backoffDelay(attempt: number, maxDelayMs: number): number {
+  const base = Math.min(RETRY_INITIAL_DELAY_MS * 2 ** attempt, maxDelayMs)
+  const jitter = base * RETRY_JITTER_RATIO * (Math.random() * 2 - 1)
+  return Math.max(0, Math.round(base + jitter))
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** True when a non-stream chat payload carries no content, tool calls or reasoning. */
+async function emptyChatPayload(response: Response): Promise<boolean> {
+  const type = response.headers.get("content-type") ?? ""
+  if (!type.includes("json")) return false
+  try {
+    const json = await response.clone().json()
+    const message = json?.choices?.[0]?.message
+    if (!message) return false
+    const hasText = typeof message.content === "string" ? message.content.trim().length > 0 : message.content != null
+    const hasTools = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+    const hasReasoning = typeof message.reasoning_content === "string" && message.reasoning_content.length > 0
+    return !hasText && !hasTools && !hasReasoning
+  } catch {
+    return false
+  }
+}
+
+/** fetch() that aborts only the time-to-first-byte window: once headers have
+ * arrived the timer is disarmed, so a slow stream is never cut mid-flight. */
+async function fetchWithTtfbTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  if (!timeoutMs) return fetch(url, init)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** True when an aborted fetch was our own TTFB timeout rather than a network drop. */
+function isTimeoutAbort(error: any): boolean {
+  return error?.name === "TimeoutError" || error?.name === "AbortError"
+}
+
 async function runUpstream(upstream: Upstream, model: string, chatBody: any, stream: boolean, session: string) {
   const protocol = protocolFor(upstream, model)
   const headers = upstreamHeaders(upstream, session, protocol)
-  const prepared = applyParamRules({ ...chatBody, model }, upstream, model)
-  if (protocol === "openai" && isDeepSeekModel(model)) injectReasoningContent(prepared.messages, session)
+  let pending = applyParamRules({ ...chatBody, model }, upstream, model)
+  if (protocol === "openai" && isDeepSeekModel(model)) injectReasoningContent(pending.messages, session)
 
-  debugLog(`--> ${upstream.id} ${protocol} ${summarizeBody(prepared)}`)
-  const response = await sendOnce(upstream, protocol, prepared, stream, model, headers, session)
-  if (response.ok) {
-    debugLog(`<-- ${response.status} ok`)
-    return response
-  }
+  debugLog(`--> ${upstream.id} ${protocol} ${summarizeBody(pending)}`)
+  const attempts = upstream.retryAttempts
+  let stripped = false
+  let altProtocol = false // the oa-compat → responses fallback may be tried once
+  let attempt = 0 // transient-ladder tries; strip/protocol alternates don't consume it
+  let lastStatus = 502
+  let lastType = "application/json"
+  let lastText = ""
 
-  let failed = response
-  let text = await response.text()
-
-  if (protocol === "openai" && /not supported for format oa-compat|Endpoint is unavailable/i.test(text)) {
-    const alt = await sendOnce(upstream, "responses", prepared, stream, model, headers, session)
-    if (alt.ok) {
-      debugLog(`<-- ${alt.status} ok (responses fallback)`)
-      return alt
+  while (true) {
+    let response: Response
+    try {
+      response = await sendOnce(upstream, protocol, pending, stream, model, headers, session)
+    } catch (error) {
+      // Transport-level failure: connect refused, DNS, or TTFB timeout.
+      const timedOut = isTimeoutAbort(error)
+      lastStatus = timedOut ? 504 : 502
+      lastType = "application/json"
+      lastText = JSON.stringify({
+        error: {
+          message: timedOut
+            ? `Upstream did not send response headers within ${upstream.timeoutMs}ms`
+            : `Upstream connection failed: ${error?.message ?? String(error)}`,
+          type: "api_error",
+          code: timedOut ? "TIMEOUT" : "TRANSPORT",
+        },
+      })
+      debugLog(`<-- ${lastStatus} transport (${error?.name ?? "Error"}: ${error?.message ?? ""})`)
+      if (attempt + 1 < attempts) {
+        attempt += 1
+        await sleep(backoffDelay(attempt - 1, upstream.retryMaxDelayMs))
+        continue
+      }
+      return new Response(lastText, { status: lastStatus, headers: { "content-type": lastType, ...CORS } })
     }
-    failed = alt
-    text = await alt.text()
-  }
-  debugLog(`<-- ${failed.status} ${text.slice(0, 4000)}`)
-  if (upstream.paramFallback) {
-    const { body: retryBody, changed } = stripReasoningParams(prepared)
-    if (changed && isParamError(failed.status, text)) {
-      const retry = await sendOnce(upstream, protocol, retryBody, stream, model, headers, session)
-      if (retry.ok) return retry
-      return relayError(retry)
+
+    if (response.ok) {
+      // A non-stream reply with no content at all is treated as EMPTY_RESPONSE
+      // (retryable); if the budget runs out the original body is relayed.
+      if (!stream && (await emptyChatPayload(response))) {
+        lastStatus = 502
+        lastType = "application/json"
+        lastText = JSON.stringify({ error: { message: "Upstream returned an empty response", type: "api_error", code: "EMPTY_RESPONSE" } })
+        debugLog(`<-- ${response.status} ok but empty (EMPTY_RESPONSE)`)
+        if (attempt + 1 < attempts) {
+          attempt += 1
+          await sleep(backoffDelay(attempt - 1, upstream.retryMaxDelayMs))
+          continue
+        }
+        return response
+      }
+      debugLog(`<-- ${response.status} ok`)
+      return response
     }
+
+    lastStatus = response.status
+    lastType = response.headers.get("content-type") ?? "application/json"
+    const lastHeaders = response.headers
+    lastText = await response.text()
+    debugLog(`<-- ${lastStatus} ${lastText.slice(0, 4000)}`)
+
+    if (protocol === "openai" && !altProtocol && /not supported for format oa-compat|Endpoint is unavailable/i.test(lastText)) {
+      altProtocol = true
+      const alt = await sendOnce(upstream, "responses", pending, stream, model, headers, session)
+      if (alt.ok) {
+        debugLog(`<-- ${alt.status} ok (responses fallback)`)
+        return alt
+      }
+      lastStatus = alt.status
+      lastType = alt.headers.get("content-type") ?? "application/json"
+      lastText = await alt.text()
+      debugLog(`<-- ${lastStatus} (responses fallback) ${lastText.slice(0, 4000)}`)
+      // Note: lastHeaders stays the original response's — close enough for
+      // Retry-After purposes and irrelevant once we fall through to strip/retry.
+    }
+
+    if (!stripped && upstream.paramFallback && isParamError(lastStatus, lastText)) {
+      const { body: retryBody, changed } = stripReasoningParams(pending)
+      if (changed) {
+        stripped = true
+        pending = retryBody
+        continue // immediate retry, does not consume the ladder budget
+      }
+    }
+
+    const code = classifyFailure(lastStatus)
+    if (code && attempt + 1 < attempts) {
+      attempt += 1
+      const delay = retryAfterMs(lastHeaders, upstream.retryMaxDelayMs) ?? backoffDelay(attempt - 1, upstream.retryMaxDelayMs)
+      await sleep(delay)
+      continue
+    }
+    break
   }
-  return new Response(text, {
-    status: failed.status,
-    headers: { "content-type": failed.headers.get("content-type") ?? "application/json", ...CORS },
-  })
+
+  return new Response(lastText, { status: lastStatus, headers: { "content-type": lastType, ...CORS } })
 }
 
 async function relayError(response: Response) {
@@ -1788,11 +2072,15 @@ export function createHandler(options: GatewayOptions = {}) {
           )
         }
         const session = sessionIdFor(request, body)
-        const response = await fetch(`${resolved.upstream.baseURL}/responses`, {
-          method: "POST",
-          headers: upstreamHeaders(resolved.upstream, session),
-          body: JSON.stringify({ ...body, model: resolved.model }),
-        })
+        const response = await fetchWithTtfbTimeout(
+          `${resolved.upstream.baseURL}/responses`,
+          {
+            method: "POST",
+            headers: upstreamHeaders(resolved.upstream, session),
+            body: JSON.stringify({ ...body, model: resolved.model }),
+          },
+          resolved.upstream.timeoutMs,
+        )
         if (!response.ok) return relayError(response)
         if (body.stream && response.body) {
           return new Response(response.body, { status: 200, headers: { ...SSE_HEADERS, ...CORS } })

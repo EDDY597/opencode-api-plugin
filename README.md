@@ -92,6 +92,8 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 | `reasoningEffortMap` | `reasoning_effort` 值重映射（如 `{"high":"medium"}`） |
 | `stripParams` | 转发前从请求体删除的参数名 |
 | `paramFallback` | 默认 `true`：上游返回 400/422 且疑似不支持推理类参数时，剥离这些参数自动重试一次 |
+| `retry` | 瞬断重试：`{"attempts": 3, "maxDelayMs": 20000}`（默认）。对 429/5xx/连接失败按 500ms 起指数退避（±10% 抖动，尊重 `Retry-After`）；401/400 等永久错误不重试 |
+| `timeoutMs` | 默认 `120000`：上游响应头必须在此时间内到达（TTFB 超时），超时按可重试错误处理；不限制已开始的流式输出，`0` 关闭 |
 | `usageBase` / `usage` | `/api/usage` 额度聚合的上游地址；`usage: false` 排除该上游 |
 | `enabled` | 开关，默认 `true` |
 
@@ -179,8 +181,11 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 ## 工作原理补充
 
 - **思考内容桥接**：chat 上游的 `reasoning_content`（DeepSeek 风格，含 `reasoning` 变体）在 Anthropic 协议端点转换为 thinking 块（流式 `thinking_delta` / 非流式 thinking block），在 Responses 协议端点转换为 reasoning summary，让支持思考展示的客户端直接渲染。
+- **内联思考剥离**：部分 Go 路由把思考以 `<think>…</think>` 标签内联在 `content` 里输出（标签可能被拆到两个增量里）；网关按增量状态机把这段内容转入 thinking 块，不再漏进正文。
 - **会话与推理缓存**：DeepSeek 类模型的 `reasoning_content` 按 `x-opencode-session` 会话缓存（LRU 200），并在后续请求中回注到 messages，保证多轮推理连续性。
 - **参数兼容回退**：上游对 `reasoning` / `thinking` / `effort` 等参数报 400/422 时（`paramFallback: true`），自动剥离全部推理类参数重试一次。
+- **瞬断重试**：上游 429 / 5xx / 连接失败 / 首字节超时按指数退避自动重试（`retry.attempts` 次内，尊重 `Retry-After`）；鉴权、参数类永久错误首次即失败。流式响应一旦开始向客户端转发就不再重试（避免输出重复），断流错误由客户端的 agent 层重跑整个请求。
+- **空回复兜底**：非流式空回复按 `EMPTY_RESPONSE` 重试；Anthropic 流式在结尾若没有任何内容块，以协议级 `error` 事件收尾而不是返回"成功的空消息"，agent 可据此重跑。
 
 ## 故障排查
 
