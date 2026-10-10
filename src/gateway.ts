@@ -286,6 +286,112 @@ export function streamFromAsync(generator: AsyncGenerator<string>): ReadableStre
   })
 }
 
+/** Copy upstream headers onto a relayed body, dropping the upstream's own framing. */
+function relayHeaders(headers: Headers): Headers {
+  const relayed = new Headers(headers)
+  relayed.delete("content-length")
+  return relayed
+}
+
+/**
+ * The OpenAI-shaped frame that ends a client stream cut short upstream. A chat
+ * client surfaces `error`, and the Anthropic converter turns the same payload
+ * into an `event: error`; `[DONE]` keeps the frame sequence well-formed.
+ * `retryable` tells the client a fresh turn is safe: a failed turn is never
+ * committed to history, so retrying cannot duplicate the bytes already shown.
+ */
+export function upstreamTruncationFrame(model: string, reason: string) {
+  return "data: " + JSON.stringify({
+    error: {
+      message: `Upstream stream ended before completion (${model}): ${reason}`,
+      type: "upstream_stream_error",
+      code: "upstream_truncated",
+      retryable: true,
+    },
+  }) + "\n\ndata: [DONE]\n\n"
+}
+
+/**
+ * Relay one upstream SSE body without letting a mid-stream upstream failure
+ * reach the client as a socket abort.
+ *
+ * While nothing has been forwarded the request is still replayable, so `resend`
+ * may hand back a fresh upstream stream and the client never sees the seam.
+ * Once bytes are on the wire a replay would duplicate output, so the only
+ * faithful ending is `terminate` — a structured error frame plus `[DONE]` —
+ * which clients surface as a real error they can retry.
+ *
+ * @param source - the successful upstream response whose body is relayed.
+ * @param resend - replay the request; undefined when a replay is unsafe or the budget is spent.
+ * @param terminate - the frame(s) that end the client stream after a cut.
+ * @param report - receives the outcome facts for the gateway log.
+ */
+export function guardedStream(
+  source: Response,
+  resend: (emitted: boolean) => Promise<Response | undefined>,
+  terminate: string,
+  report: (detail: { emitted: boolean; replays: number; reason: string }) => void,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder()
+  return streamFromAsync((async function* relay() {
+    let current: Response = source
+    let emitted = false
+    let replays = 0
+    let tail = ""
+    while (true) {
+      const reader = current.body!.getReader()
+      let failure: unknown
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) {
+            // Normal end: flush anything held back — no data loss on the happy path.
+            if (tail.length > 0) {
+              emitted = true
+              yield tail
+              tail = ""
+            }
+            return
+          }
+          if (value === undefined || value.byteLength === 0) continue
+          const text = tail + decoder.decode(value, { stream: true })
+          const seam = text.lastIndexOf("\n\n")
+          if (seam === -1) {
+            // No complete event yet: hold the bytes back so that a later cut
+            // drops the partial frame instead of shipping it.
+            tail = text
+            continue
+          }
+          const complete = text.slice(0, seam + 2)
+          tail = text.slice(seam + 2)
+          if (complete.length > 0) {
+            emitted = true
+            yield complete
+          }
+        }
+      } catch (error) {
+        failure = error
+      } finally {
+        try { await reader.cancel() } catch { void 0 }
+      }
+      const replacement = await resend(emitted)
+      if (replacement !== undefined) {
+        replays += 1
+        current = replacement
+        tail = ""  // the replayed stream starts from nothing
+        continue
+      }
+      report({ emitted, replays, reason: failure instanceof Error ? failure.message : String(failure) })
+      // The held tail is an incomplete frame — drop it, never relay it.
+      // Relaying the partial line (padded to an event boundary) hands strict
+      // SSE parsers invalid JSON and they die before reading the structured
+      // error frame below.
+      yield terminate
+      return
+    }
+  })())
+}
+
 export async function* responsesStreamToChat(
   stream: ReadableStream<Uint8Array>,
   model: string,
@@ -1697,18 +1803,21 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
     } catch (error) {
       // Transport-level failure: connect refused, DNS, or TTFB timeout.
       const timedOut = isTimeoutAbort(error)
+      // undici hides the real reason in `cause` (connect timeout, TLS, proxy
+      // refusal); without it a bare "fetch failed" says nothing actionable.
+      const cause = error?.cause?.message ?? error?.cause?.code
       lastStatus = timedOut ? 504 : 502
       lastType = "application/json"
       lastText = JSON.stringify({
         error: {
           message: timedOut
             ? `Upstream did not send response headers within ${upstream.timeoutMs}ms`
-            : `Upstream connection failed: ${error?.message ?? String(error)}`,
+            : `Upstream connection failed: ${error?.message ?? String(error)}${cause ? ` (${cause})` : ""}`,
           type: "api_error",
           code: timedOut ? "TIMEOUT" : "TRANSPORT",
         },
       })
-      debugLog(`<-- ${lastStatus} transport (${error?.name ?? "Error"}: ${error?.message ?? ""})`)
+      debugLog(`<-- ${lastStatus} transport (${error?.name ?? "Error"}: ${error?.message ?? ""}${cause ? ` | ${cause}` : ""})`)
       if (attempt + 1 < attempts) {
         attempt += 1
         await sleep(backoffDelay(attempt - 1, upstream.retryMaxDelayMs))
@@ -1733,7 +1842,36 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
         return response
       }
       debugLog(`<-- ${response.status} ok`)
-      return response
+      if (!stream || response.body === null) return response
+      // The upstream accepted the request, so a later cut is ours to contain
+      // instead of letting the client's socket abort mid-body.
+      return new Response(
+        guardedStream(
+          response,
+          async (emitted) => {
+            // Bytes already relayed are not replayable without duplicating output.
+            if (emitted || attempt + 1 >= attempts) return undefined
+            attempt += 1
+            await sleep(backoffDelay(attempt - 1, upstream.retryMaxDelayMs))
+            try {
+              const replay = await sendOnce(upstream, protocol, pending, stream, model, headers, session)
+              if (replay.ok && replay.body !== null) {
+                debugLog(`<== stream cut before the first byte; replayed (${attempt}/${attempts})`)
+                return replay
+              }
+              debugLog(`<== stream replay answered ${replay.status}; not retrying`)
+            } catch (error: any) {
+              debugLog(`<== stream replay failed (${error?.message ?? error})`)
+            }
+            return undefined
+          },
+          upstreamTruncationFrame(model, "upstream stream failed mid-response"),
+          ({ emitted, replays, reason }) => {
+            debugLog(`<== truncated model=${model} upstream=${upstream.id} emitted=${emitted} replays=${replays} reason=${reason}`)
+          },
+        ),
+        { status: response.status, statusText: response.statusText, headers: relayHeaders(response.headers) },
+      )
     }
 
     lastStatus = response.status

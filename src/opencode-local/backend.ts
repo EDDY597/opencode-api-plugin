@@ -24,6 +24,9 @@ export type BackendState = {
   isStarting: boolean
   process: any
   jailRoot: string | null
+  /** True while an intentional kill (respawn or shutdown) is in flight, so the
+   * exit listener can tell "stopped by us" from "died on its own". */
+  expectExit?: boolean
 }
 
 const backendState = new Map<string, BackendState>()
@@ -268,14 +271,25 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
   } = config
 
   if (state.isStarting) {
+    let starterDied = false
     for (let i = 0; i < STARTING_WAIT_ITERATIONS; i++) {
       await sleep(STARTING_WAIT_INTERVAL_MS)
       try {
         await checkHealth(serverUrl, serverPassword)
         return
-      } catch {}
+      } catch {
+        const starter = state.process
+        // A starter that exited will never become healthy; waiting out the full
+        // budget only burns a minute of every queued request.
+        if (starter && starter.exitCode !== null) {
+          starterDied = true
+          break
+        }
+      }
     }
-    throw new Error("Backend startup timeout")
+    if (!starterDied) throw new Error("Backend startup timeout")
+    // Fall through: the starter died before becoming healthy, so the spawn
+    // below raises a replacement and this request still completes.
   }
 
   try {
@@ -295,7 +309,10 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
     state.isStarting = true
     console.log(`[Local] OpenCode backend not found at ${serverUrl}. Starting...`)
 
-    if (state.process) killProcessTree(state.process)
+    if (state.process) {
+      state.expectExit = true
+      killProcessTree(state.process)
+    }
 
     if (state.jailRoot && fs.existsSync(state.jailRoot)) {
       try {
@@ -321,7 +338,14 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
     let envVars: Record<string, any>
     let cwd: string
 
-    fs.mkdirSync(workspace, { recursive: true })
+    try {
+      fs.mkdirSync(workspace, { recursive: true })
+    } catch (e: any) {
+      // Without this reset a failed workspace creation would latch isStarting
+      // and every later request would wait out the full startup budget.
+      state.isStarting = false
+      throw new Error(`Failed to create backend workspace ${workspace}: ${e.message}`)
+    }
     cwd = workspace
 
     if (isWindows) {
@@ -380,21 +404,36 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
     }
 
     const useShell = process.platform === "win32" || !resolved.path || opencodeBin.endsWith(".cmd") || opencodeBin.endsWith(".bat")
-    state.process = spawn(opencodeBin, ["serve", "--port", port, "--hostname", "127.0.0.1"], {
+    const child = spawn(opencodeBin, ["serve", "--port", port, "--hostname", "127.0.0.1"], {
       stdio: "inherit",
       cwd,
       env: envVars,
       shell: useShell,
     })
+    state.process = child
 
-    state.process.on("error", (err: any) => {
+    child.on("error", (err: any) => {
       console.error(`[Local] Failed to spawn OpenCode: ${err.message}`)
       if (err.code === "ENOENT") {
         console.error(`[Local] Command '${opencodePath}' not found. Please ensure OpenCode is installed and in your PATH.`)
       }
     })
 
+    // A backend death has historically been silent (nothing on stdio), leaving
+    // the gateway answering `fetch failed` with no hint why. Log the exit and
+    // whether it was ours to cause.
+    child.on("exit", (code, signal) => {
+      const detail = `code=${code === null ? "null" : code}${signal ? ` signal=${signal}` : ""}`
+      if (state.expectExit) {
+        state.expectExit = false
+        console.log(`[Local] OpenCode backend stopped (${detail})`)
+      } else {
+        console.error(`[Local] OpenCode backend exited unexpectedly (${detail}). The next request respawns it.`)
+      }
+    })
+
     let started = false
+    let startupExitCode: number | null | undefined // undefined until the child is seen exiting
     for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
       await sleep(STARTUP_WAIT_INTERVAL_MS)
       try {
@@ -402,14 +441,20 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
         console.log("[Local] OpenCode backend ready.")
         started = true
         break
-      } catch {}
+      } catch {
+        if (state.process === child && child.exitCode !== null) {
+          startupExitCode = child.exitCode
+          console.error(`[Local] OpenCode backend exited during startup: code=${startupExitCode}`)
+          break
+        }
+      }
     }
 
     state.isStarting = false
 
     if (!started) {
       console.warn("[Local] Backend start timed out.")
-      throw new Error("Backend start timeout")
+      throw new Error(startupExitCode !== undefined ? `OpenCode backend exited during startup (code=${startupExitCode})` : "Backend start timeout")
     }
   }
 }
@@ -418,7 +463,10 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
 export function killBackendFor(serverUrl: string) {
   const state = backendState.get(serverUrl)
   if (!state) return
-  if (state.process) killProcessTree(state.process)
+  if (state.process) {
+    state.expectExit = true
+    killProcessTree(state.process)
+  }
   if (state.jailRoot && process.platform !== "win32") {
     try {
       fs.rmSync(state.jailRoot, { recursive: true, force: true })

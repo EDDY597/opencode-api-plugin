@@ -1197,6 +1197,9 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
             reasoning_effort: reasoningLevel,
           }
 
+          // Model resolution is the first backend call; if the backend is dead
+          // it would fail here and the respawn logic would never be reached.
+          await ensureBackendOnce()
           const resolvedModel = await resolveRequestedModel(model)
           const pID = resolvedModel.providerID
           const mID = resolvedModel.modelID
@@ -1319,8 +1322,6 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
           if (!parts.length) {
             return jsonResponse({ error: { message: "messages must include at least one non-system text message" } }, 400)
           }
-
-          await ensureBackendOnce()
 
           try {
             await client.configUpdate({ activeModel: { providerID: pID, modelID: mID } })
@@ -1849,11 +1850,12 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
         return jsonResponse({ error: { message: "input is required" } }, 400)
       }
 
+      // See handleChat: the backend check must precede model resolution so a
+      // dead backend respawns instead of failing the resolution fetch.
+      await ensureBackendOnce()
       const resolvedModel = await resolveRequestedModel(model || previousState?.model)
       const pID = resolvedModel.providerID
       const mID = resolvedModel.modelID
-
-      await ensureBackendOnce()
 
       try {
         await client.configUpdate({ activeModel: { providerID: pID, modelID: mID } })

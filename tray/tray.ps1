@@ -11,9 +11,88 @@ Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'SilentlyContinue'
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Single instance: two tray copies would both spawn/stop the same gateway.
+# An abandoned mutex (a previous tray died holding it) must be survivable,
+# otherwise the tray could never start again.
+if (-not $SelfTest) {
+  $script:Mutex = New-Object System.Threading.Mutex($false, 'Global\OpenCodeGatewayTray')
+  $script:MutexOwned = $false
+  try { $script:MutexOwned = $script:Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $script:MutexOwned = $true }
+  if (-not $script:MutexOwned) { exit 0 }
+}
+
 $script:Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:Root = if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $script:Here) 'gateway.config.json')) { Split-Path -Parent $script:Here } else { $script:Here }
 $script:ConfigPath = Join-Path $script:Root 'gateway.config.json'
+
+# Node's fetch ignores HTTP(S)_PROXY unless this is set before the process starts.
+$env:NODE_USE_ENV_PROXY = '1'
+
+# The gateway and its embedded backend only reach their upstreams through the
+# user's proxy (poisoned LAN DNS on this machine). A tray launched from a shell
+# without those vars (scheduler, another terminal) would run the whole chain
+# proxy-less, so fall back to the registry user environment.
+foreach ($name in 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY') {
+  if (-not [Environment]::GetEnvironmentVariable($name, 'Process')) {
+    $value = [Environment]::GetEnvironmentVariable($name, 'User')
+    if ($value) { [Environment]::SetEnvironmentVariable($name, $value, 'Process') }
+  }
+}
+
+# Probe facts shared with the background thread. The UI thread only reads.
+$script:State = [hashtable]::Synchronized(@{
+  Running = $true
+  Healthy = $false
+  Streak = 0
+  Usage = $null
+  UsageFailed = $false
+})
+
+# --- background probes ---------------------------------------------------------
+# Every WinForms timer tick runs on the UI thread; a synchronous health/usage
+# HTTP call there freezes an open context menu for as long as the endpoint
+# stalls (health 2s, usage up to 10s) — menus that "open but ignore the mouse".
+# All probing therefore happens on a background runspace; the UI only reads.
+function Start-ProbeThread {
+  param([string]$Base, $State)
+  $script:ProbeRunspace = [runspacefactory]::CreateRunspace()
+  $script:ProbeRunspace.Open()
+  $script:ProbeThread = [powershell]::Create()
+  $script:ProbeThread.Runspace = $script:ProbeRunspace
+  $probe = {
+    param([string]$Base, $State)
+    $lastUsageAt = [datetime]::MinValue
+    while ($State.Running) {
+      $healthy = $false
+      try { Invoke-RestMethod -Uri ($Base + '/health') -TimeoutSec 2 | Out-Null; $healthy = $true } catch {}
+      $State.Healthy = $healthy
+      if ($healthy) { $State.Streak = 0 } else { $State.Streak += 1 }
+      if ($healthy -and ((Get-Date) - $lastUsageAt).TotalSeconds -ge 55) {
+        try {
+          $State.Usage = Invoke-RestMethod -Uri ($Base + '/api/usage') -TimeoutSec 8
+          $State.UsageFailed = $false
+        } catch { $State.UsageFailed = $true }
+        $lastUsageAt = Get-Date
+      }
+      Start-Sleep -Milliseconds 3000
+    }
+  }
+  $null = $script:ProbeThread.AddScript($probe).AddArgument($Base).AddArgument($State)
+  $script:ProbeHandle = $script:ProbeThread.BeginInvoke()
+}
+
+function Stop-ProbeThread {
+  $script:State.Running = $false
+  if ($script:ProbeThread) {
+    try { $script:ProbeThread.Stop() } catch {}
+    try { $script:ProbeThread.Dispose() } catch {}
+    $script:ProbeThread = $null
+  }
+  if ($script:ProbeRunspace) {
+    try { $script:ProbeRunspace.Close() } catch {}
+    $script:ProbeRunspace = $null
+  }
+}
 
 function Get-Port {
   if (Test-Path -LiteralPath $script:ConfigPath) {
@@ -53,18 +132,10 @@ function Format-Reset($iso) {
   } catch { return [string]$iso }
 }
 
-function Build-Tooltip {
-  if (-not (Test-Gateway)) {
-    if ($script:Proc -and -not $script:Proc.HasExited) { return 'LLM Gateway：启动中...' }
-    return 'LLM Gateway：未运行'
-  }
-  $u = Get-Usage
-  if ($null -eq $u) { return 'LLM Gateway：额度读取失败' }
+function Format-UsageTooltip($u) {
   if ((-not $u.entries -or @($u.entries).Count -eq 0) -and $u.errors -and @($u.errors).Count -gt 0) {
     $code = [string]$u.errors[0].code
-    if ($u.errors[0].message -match 'subscription required' -or $code -eq 'UNKNOWN') {
-      if ([string]$u.errors[0].message -match 'subscription required') { return 'LLM Gateway：额度需 OpenCode Go 订阅' }
-    }
+    if ([string]$u.errors[0].message -match 'subscription required') { return 'LLM Gateway：额度需 OpenCode Go 订阅' }
     return 'LLM Gateway：额度错误 ' + $code
   }
   $entries = @($u.entries)
@@ -74,7 +145,18 @@ function Build-Tooltip {
   foreach ($e in $entries) {
     $lines += ('{0} {1}% {2}' -f (Period-Label $e.period), [int]$e.remaining, (Format-Reset $e.resetAt))
   }
-  $text = $lines -join [Environment]::NewLine
+  return $lines -join [Environment]::NewLine
+}
+
+function Build-Tooltip {
+  # Composed from probe facts only — never does network I/O of its own.
+  if (-not $script:State.Healthy) {
+    if ($script:Proc -and -not $script:Proc.HasExited) { return 'LLM Gateway：启动中...' }
+    return 'LLM Gateway：未运行'
+  }
+  if ($script:State.UsageFailed) { return 'LLM Gateway：额度读取失败' }
+  if ($null -eq $script:State.Usage) { return 'LLM Gateway' }
+  $text = Format-UsageTooltip $script:State.Usage
   if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
   return $text
 }
@@ -114,7 +196,10 @@ function Stop-GatewayProcess {
   if ($script:Proc -and -not $script:Proc.HasExited) {
     Start-Process -FilePath 'taskkill' -ArgumentList '/F', '/T', '/PID', $script:Proc.Id -WindowStyle Hidden -Wait
   } else {
-    # Attached to an externally started gateway: stop whatever listens on the port.
+    # Attached to an externally started gateway: stop whatever listens on the
+    # port. taskkill /T takes the whole tree — killing only the node pid would
+    # orphan the embedded `opencode serve` backend, which the next start would
+    # then adopt together with its stale environment.
     $port = Get-Port
     $pids = @()
     try {
@@ -126,16 +211,25 @@ function Stop-GatewayProcess {
         if ($line -match '\s(\d+)\s*$') { $pids += [int]$Matches[1] }
       }
     }
-    foreach ($p in $pids) { if ($p -and $p -ne $PID) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } }
+    foreach ($p in $pids) {
+      if ($p -and $p -ne $PID) {
+        Start-Process -FilePath 'taskkill' -ArgumentList '/F', '/T', '/PID', $p -WindowStyle Hidden -Wait
+      }
+    }
   }
   $script:Proc = $null
 }
 
 function Start-GatewayProcess {
   if (Test-Gateway) { return $true }  # already running (externally) — attach
+  $env:OPENCODE_GO_DEBUG_LOG = Join-Path $script:Root 'gateway-debug.log'
+  # Hidden console: node is a console app, and a visible console ties the
+  # gateway's life to that window — closing the window kills the gateway.
   $script:Proc = Start-Process -FilePath (Resolve-NodeExe) `
     -ArgumentList ('"' + (Join-Path $script:Root 'src\standalone.ts') + '"') `
-    -WorkingDirectory $script:Root -WindowStyle Hidden -PassThru
+    -WorkingDirectory $script:Root -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $script:Root 'gateway.out.log') `
+    -RedirectStandardError (Join-Path $script:Root 'gateway.err.log')
   return $false  # readiness is picked up by the monitor timer
 }
 
@@ -146,9 +240,9 @@ function Restart-Gateway {
 }
 
 function Quit-All([bool]$stopGateway) {
+  Stop-ProbeThread
   if ($stopGateway) { Stop-GatewayProcess }
   $script:Monitor.Stop()
-  $script:UsageTimer.Stop()
   $script:Notify.Visible = $false
   $script:Notify.Dispose()
   [System.Windows.Forms.Application]::ExitThread()
@@ -250,6 +344,11 @@ function Show-Settings {
 # --- tray UI ------------------------------------------------------------------
 
 if ($SelfTest) {
+  # One synchronous probe so the tooltip reflects reality (no UI here to freeze).
+  if (Test-Gateway) {
+    $script:State.Healthy = $true
+    try { $script:State.Usage = Invoke-RestMethod -Uri ((Get-Base) + '/api/usage') -TimeoutSec 8 } catch { $script:State.UsageFailed = $true }
+  }
   Write-Output ('root=' + $script:Root)
   Write-Output ('base=' + (Get-Base))
   Write-Output ('gateway=' + (Test-Gateway))
@@ -291,6 +390,7 @@ function Update-Tray {
 }
 
 # Startup: attach to a running gateway or spawn one.
+Start-ProbeThread -Base (Get-Base) -State $script:State
 if (-not (Test-Gateway)) {
   Start-GatewayProcess | Out-Null
   Write-Host 'LLM Gateway: spawning gateway process...'
@@ -298,49 +398,37 @@ if (-not (Test-Gateway)) {
   Write-Host 'LLM Gateway: attaching to running gateway...'
 }
 
-# Monitor (3s): icon state syncs with the gateway process. If the gateway dies
+# Monitor (3s): icon state syncs with the probe facts. If the gateway dies
 # for good, the tray closes itself so the icon never lies about the process.
-$script:FailStreak = 0
 $script:Monitor = New-Object System.Windows.Forms.Timer
 $script:Monitor.Interval = 3000
 $script:Monitor.Add_Tick({
     try {
       if ($script:Proc -and $script:Proc.HasExited) {
         $script:Monitor.Stop()
-        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '网关进程已退出，托盘随之关闭', [System.Windows.Forms.ToolTipIcon]::Warning)
+        Stop-ProbeThread
+        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '缃戝叧杩涚▼宸查€€鍑猴紝鎵樼洏闅忎箣鍏抽棴', [System.Windows.Forms.ToolTipIcon]::Warning)
         $script:QuitTimer = New-Object System.Windows.Forms.Timer
         $script:QuitTimer.Interval = 1200
         $script:QuitTimer.Add_Tick({ $script:QuitTimer.Stop(); Quit-All $false })
         $script:QuitTimer.Start()
         return
       }
-      if (Test-Gateway) {
-        $script:FailStreak = 0
-        $script:Notify.Icon = $script:IconOn
-      } else {
-        $script:FailStreak += 1
-        $script:Notify.Icon = $script:IconOff
-        if (-not $script:Proc -and $script:FailStreak -ge 2) {
-          # Attached external gateway is gone — keep icon presence in sync.
-          $script:Monitor.Stop()
-          $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '网关已停止，托盘随之关闭', [System.Windows.Forms.ToolTipIcon]::Warning)
-          $script:QuitTimer = New-Object System.Windows.Forms.Timer
-          $script:QuitTimer.Interval = 1200
-          $script:QuitTimer.Add_Tick({ $script:QuitTimer.Stop(); Quit-All $false })
-          $script:QuitTimer.Start()
-          return
-        }
-      }
       Update-Tray
+      if (-not $script:State.Healthy -and -not $script:Proc -and $script:State.Streak -ge 2) {
+        # Attached external gateway is gone 鈥 keep icon presence in sync.
+        $script:Monitor.Stop()
+        Stop-ProbeThread
+        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '缃戝叧宸插仠姝.{0}', [System.Windows.Forms.ToolTipIcon]::Warning)
+        $script:QuitTimer = New-Object System.Windows.Forms.Timer
+        $script:QuitTimer.Interval = 1200
+        $script:QuitTimer.Add_Tick({ $script:QuitTimer.Stop(); Quit-All $false })
+        $script:QuitTimer.Start()
+        return
+      }
     } catch { }
   })
 $script:Monitor.Start()
-
-# Usage/tooltip refresh (60s): OpenCode 5h / week / month balance.
-$script:UsageTimer = New-Object System.Windows.Forms.Timer
-$script:UsageTimer.Interval = 60000
-$script:UsageTimer.Add_Tick({ Update-Tray })
-$script:UsageTimer.Start()
 
 Update-Tray
 
@@ -348,3 +436,7 @@ $ctx = New-Object System.Windows.Forms.ApplicationContext
 [System.Windows.Forms.Application]::Run($ctx)
 $script:Notify.Visible = $false
 $script:Notify.Dispose()
+if ($script:Mutex) {
+  try { $script:Mutex.ReleaseMutex() } catch {}
+  $script:Mutex.Dispose()
+}

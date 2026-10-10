@@ -3,3 +3,5 @@ tray/tray.settings.json
 tray/tray.ico
 node_modules/
 *.log
+.zcode/
+config.json

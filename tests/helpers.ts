@@ -31,7 +31,7 @@ export type MockRoute = (
   request: { method: string; url: string; headers: Record<string, string> },
   body: string,
   hit: number,
-) => { status: number; headers?: Record<string, string>; body: string } | Promise<{ status: number; headers?: Record<string, string>; body: string }>
+) => { status: number; headers?: Record<string, string>; body: string; cutAfterBytes?: number } | Promise<{ status: number; headers?: Record<string, string>; body: string; cutAfterBytes?: number }>
 
 export type MockUpstream = {
   readonly server: Server
@@ -63,6 +63,16 @@ export async function startMockUpstream(route: MockRoute): Promise<MockUpstream>
         requests.length,
       )
       response.writeHead(handled.status, handled.headers ?? { "content-type": "application/json" })
+      if (typeof handled.cutAfterBytes === "number") {
+        // Relay only a prefix and kill the connection: the mid-body cut an
+        // HTTP client reports as `TypeError: terminated`. Headers are flushed
+        // first so this is a body-level failure, not a connect-level one.
+        response.flushHeaders()
+        const bytes = Buffer.from(handled.body, "utf8")
+        if (handled.cutAfterBytes > 0) response.write(bytes.subarray(0, handled.cutAfterBytes))
+        setTimeout(() => response.socket?.destroy(), 5)
+        return
+      }
       response.end(handled.body)
     })
   })

@@ -37,9 +37,9 @@ cp gateway.config.example.json gateway.config.json
 #    编辑 gateway.config.json：设置 token，填上游的 apiKey
 
 # 2. 启动
-start-gateway.cmd              # 前台窗口，可看日志
-start-gateway-hidden.vbs       # 静默后台运行
-tray\tray.cmd                  # 托盘模式（推荐）：托盘启动并托管网关
+start-tray-hidden.vbs          # 托盘模式（推荐，可配置为开机自启）
+start-gateway.cmd              # 前台窗口，可看日志（调试用；注意该窗口承载网关进程，关窗即停）
+start-gateway-hidden.vbs       # 裸网关静默后台运行（无托盘监管，一般不用）
 
 # 3. 验证
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
@@ -47,16 +47,20 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 
 ## 系统托盘
 
-`tray\tray.ps1`（经 `tray.cmd` / `tray-hidden.vbs` 启动）是网关的托盘管家，**图标存在 = 网关进程在运行**：
+`tray\tray.ps1`（经根目录 `start-tray-hidden.vbs` 或 `tray\tray.cmd` 启动）是网关的托盘管家，**图标存在 = 网关进程在运行**：
 
-- 启动时若网关未运行则自动拉起（隐藏窗口）；已运行则直接接管
+- 单实例互斥锁：同一托盘误开双份会静默退出（另撞上废弃互斥锁也能正常启动）
+- 启动时若网关未运行则自动拉起（隐藏控制台窗口——网关不再和任何可见窗口绑定生命周期）；已运行则直接接管
 - 托盘**绿色**图标 = 网关健康；**灰色** = 启动中/异常
-- **悬停**显示 OpenCode 额度：5h / 周 / 月窗口的剩余百分比与重置时间（需 Go 订阅权益，未订阅显示对应提示）；每 60 秒刷新
+- **悬停**显示 OpenCode 额度：5h / 周 / 月窗口的剩余百分比与重置时间（需 Go 订阅权益，未订阅显示对应提示）
 - **右键菜单**：
   - **重启服务** —— 杀掉网关进程树并重新拉起（改完 gateway.config.json 后用它生效）
   - **设置...** —— 弹窗编辑嵌入式上游的常用参数：OpenCode API Key（Zen 密钥，同时用于后端付费模型与额度查询）、opencode 可执行文件路径、调试日志开关；保存后自动重启生效
   - **退出** —— 停止网关并关闭托盘
 - 网关进程退出（崩溃/被杀）时托盘弹出气泡提示并自动关闭，图标不会谎报状态
+- 健康检查与额度查询全部在后台线程执行，UI 线程零网络 I/O——右键菜单不会再因网关/代理变慢而卡死
+- 停止"附加模式"下发现的外部网关时同样杀整个进程树，嵌入式后端不会变成孤儿被下次启动收养
+- 代理环境变量兜底：托盘/启动脚本发现进程环境缺 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` 时，自动从注册表用户级环境变量补齐——从任何 shell（计划任务、终端）启动链路都完整
 
 注意：托盘与网关是同生关系——关托盘即停网关。想让网关脱离托盘常驻，用 `start-gateway-hidden.vbs` 启动即可（此时托盘只做监控与显示）。
 
@@ -166,7 +170,7 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 - 首次请求后端会自动拉起（实例初始化约 10~20 秒，之后恢复毫秒级）；网关退出时自动关闭后端。
 - 客户端接入：地址 `http://127.0.0.1:8787/v1`，密钥为网关 `token`，模型名如 `free/opencode/space-bunny-free`。
 - 三种协议端点 + 流式均已实测打通；仅免费档模型可用，付费模型会由上游报 `Insufficient account funds`。
-- 若后端无法访问 Zen，先确认本机代理环境变量（`HTTPS_PROXY` 等）指向的代理客户端正在运行，或将其清空走直连。
+- 代理：后端与云端上游都靠 `HTTPS_PROXY` 等环境变量出网。Node 的 `fetch` 默认不读这些变量，三个启动入口（两个 start 脚本 + 托盘）已固定设 `NODE_USE_ENV_PROXY=1`，环境里有代理变量即自动生效。DNS 被污染时直连会报 `self signed certificate` / `Unable to connect`，此时必须走代理。
 
 也可改为传统部署：单独运行 opencode2api 服务，然后用 `type: "openai"` + `baseURL` 指向它，效果等同。
 
@@ -177,6 +181,9 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 | `OPENCODE_GO_API_KEY` | OpenCode Go 预设的密钥（优先于配置文件 `apiKey`） |
 | `OPENCODE_GO_GATEWAY_HOST` / `_PORT` | 监听地址 / 端口 |
 | `OPENCODE_GO_GATEWAY_TOKEN` | 网关鉴权 token |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 上游出网代理，例如 `http://127.0.0.1:7897`；opencode CLI/后端同样读它 |
+| `NO_PROXY` | 代理白名单，必须含回环（`localhost,127.0.0.1,::1`），否则网关访问本机后端也会被代理 |
+| `NODE_USE_ENV_PROXY` | 让 Node 的 `fetch` 读取上面的代理变量；启动入口已设为 `1`，手动 `node src/standalone.ts` 时需自带 |
 
 ## 工作原理补充
 
@@ -184,8 +191,18 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 - **内联思考剥离**：部分 Go 路由把思考以 `<think>…</think>` 标签内联在 `content` 里输出（标签可能被拆到两个增量里）；网关按增量状态机把这段内容转入 thinking 块，不再漏进正文。
 - **会话与推理缓存**：DeepSeek 类模型的 `reasoning_content` 按 `x-opencode-session` 会话缓存（LRU 200），并在后续请求中回注到 messages，保证多轮推理连续性。
 - **参数兼容回退**：上游对 `reasoning` / `thinking` / `effort` 等参数报 400/422 时（`paramFallback: true`），自动剥离全部推理类参数重试一次。
-- **瞬断重试**：上游 429 / 5xx / 连接失败 / 首字节超时按指数退避自动重试（`retry.attempts` 次内，尊重 `Retry-After`）；鉴权、参数类永久错误首次即失败。流式响应一旦开始向客户端转发就不再重试（避免输出重复），断流错误由客户端的 agent 层重跑整个请求。
+- **瞬断重试**：上游 429 / 5xx / 连接失败 / 首字节超时按指数退避自动重试（`retry.attempts` 次内，尊重 `Retry-After`）；鉴权、参数类永久错误首次即失败。流式响应在首字节到达前被切断会自动重放，客户端无感；开始转发后再被切断（上游掐断长连接等），以**唯一一个结构化错误帧**收尾（`code: "upstream_truncated"` + `retryable: true`），客户端可安全重跑整轮（失败轮不会写入历史，重试不会重复输出）；落在帧中间的残缺字节直接丢弃，不会发给客户端导致其解析器崩溃。
 - **空回复兜底**：非流式空回复按 `EMPTY_RESPONSE` 重试；Anthropic 流式在结尾若没有任何内容块，以协议级 `error` 事件收尾而不是返回"成功的空消息"，agent 可据此重跑。
+
+## 开发与测试
+
+零依赖，直接用 Node 原生类型剥离运行；测试同样：
+
+```bash
+node --test          # 全部测试（协议转换、重试梯子、流截断、参数回退、本地后端自愈）
+```
+
+本地后端的测试使用假 `opencode` 二进制（.cmd 包一个小 HTTP 服务器），不需要真实 opencode 安装。
 
 ## 故障排查
 
@@ -199,3 +216,7 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 | `/v1/models` 为空或缺上游 | `baseURL` 需含版本段（以 `/v1` 结尾）；检查上游是否 `enabled` 且可达 |
 | 嵌入式上游首个请求很慢（10~20 秒） | opencode 实例首次初始化，属正常现象；之后恢复毫秒级 |
 | 嵌入式上游报 `Cannot connect to API` | 后端访问不了 Zen。检查 `HTTPS_PROXY` 等代理环境变量：代理客户端没跑就清空它们走直连，代理在跑就确认端口可达 |
+| 嵌入式上游报 `500 {"message":"fetch failed"}`、反复"重连" | 本地 `opencode serve` 后端进程死了。`netstat -ano \| findstr :10001` 无 LISTENING 即确认。新版网关会在下个请求自动重新拉起后端（并记录退出码到日志）；旧版需重启网关 |
+| 流式回合报 `upstream_truncated` | 上游掐断了长连接（代理或服务端行为），网关已丢弃残缺帧并以带 `retryable` 的结构化错误帧收尾；客户端重跑整轮即可 |
+| 报 `self signed certificate` / `Unable to connect` / 网关 502 `Upstream connection failed` | 本机到 `opencode.ai` 的直连被 DNS 污染或劫持。确认代理在跑且 `HTTPS_PROXY`、`NODE_USE_ENV_PROXY` 已生效（改完环境变量要重启网关与终端；`netstat -ano \| findstr 7897` 能看到网关/后端连着代理端口即为生效） |
+| opencode CLI 本身报同样的 `Cannot connect to API` | 同因：CLI 不读系统代理，只认 `HTTPS_PROXY` 环境变量。`setx HTTPS_PROXY http://127.0.0.1:7897` 后重开终端 |

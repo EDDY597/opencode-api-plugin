@@ -80,6 +80,18 @@ server.on("error", (error: any) => {
 
 server.listen(port, hostname, () => {
   console.log(`OpenCode Go gateway listening on http://${hostname}:${port}/v1`)
+  // Node's fetch ignores HTTP(S)_PROXY unless NODE_USE_ENV_PROXY/--use-env-proxy
+  // was set before the process started, and this host reaches its upstreams only
+  // through that proxy: without it every call fails as `fetch failed` (connect
+  // timeout) while /v1/models still answers from the local catalog. Say so once,
+  // loudly, instead of leaving 502s to explain themselves.
+  const proxyEnv = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY ?? process.env.https_proxy ?? process.env.http_proxy
+  if (proxyEnv !== undefined && process.env.NODE_USE_ENV_PROXY === undefined) {
+    console.warn(
+      `[Gateway] HTTPS_PROXY=${proxyEnv} is set but NODE_USE_ENV_PROXY is not: fetch connects directly and upstream calls will fail on a proxied network.`
+      + ' Start through start-gateway.cmd or the tray (both set it) instead of a bare `node src/standalone.ts`.',
+    )
+  }
   for (const upstream of localUpstreams) {
     upstream.local
       ?.warmup()
