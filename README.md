@@ -6,6 +6,8 @@
 
 零依赖（仅用 Node 内置模块，无需 `npm install`），Windows 友好（脚本启动 + 系统托盘）。
 
+> **DeepSeek Harness 桌面用户**：配套插件 [EDDY597/dsh-opencode-gateway](https://github.com/EDDY597/dsh-opencode-gateway) 把本网关（订阅模型）与本机免费档一并接入 DSH 的模型菜单，自带模型管理设置页；其免费档路由内嵌 opencode2api，不依赖本网关运行。
+
 ## 解决什么问题
 
 - 客户端各说各话：有的只发 OpenAI Chat Completions，有的只发 Anthropic Messages（如 Claude Code 类工具），有的用 Responses API。网关在入口做协议转换，任何客户端都能接任何上游。
