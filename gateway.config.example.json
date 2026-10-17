@@ -8,7 +8,6 @@
       "name": "OpenCode Go",
       "type": "opencode-go",
       "prefix": "go",
-      "apiKey": "REPLACE_WITH_YOUR_OPENCODE_API_KEY",
       "paramFallback": true,
       "enabled": true
     },

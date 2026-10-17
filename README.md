@@ -139,18 +139,19 @@ DSH 插件 [EDDY597/dsh-opencode-gateway](https://github.com/EDDY597/dsh-opencod
       "name": "OpenCode Go",
       "type": "opencode-go",
       "prefix": "go",
-      "apiKey": "<OpenCode API Key；删掉这一行则读本机 opencode 登录态>",
       "enabled": true
     }
   ]
 }
 ```
 
+不写 `apiKey` 时读本机 `opencode auth login` 的登录态；要显式指定就加 `"apiKey": "..."`，且必须是已开通 Go 订阅的 Key（见下面第 3 条）。
+
 检查清单：
 
 1. `type` 必须是 `opencode-go`（官方端点 + 本机登录态 + 协议映射）。
 2. `prefix` 必须是 **`go`**。写成 `opencode-go` 时 `/v1/models` 会列成 `opencode-go/...`，插件的 Go 卡按设计会把它当成"本地后端目录"丢弃，刷新结果为空。
-3. `enabled` 必须是 `true`，且 `apiKey` 不能还是 `REPLACE_WITH_...` 占位符。
+3. `enabled` 必须是 `true`。`apiKey` 必须是**已开通 OpenCode Go 订阅**的 Key；不确定就删掉这一行，让网关读本机 `opencode auth login` 的登录态。用错 Key 时模型列表可能仍正常（目录是公开的），但聊天会返回 `403 An active OpenCode Go subscription is required to use Go models`。
 4. 网关 `token` 与 `~/.dsh/.env` 的 `OPENCODE_GATEWAY_KEY` 必须一致（网关未设 token 时，后者填任意非空值）。
 5. 改完重启网关（托盘 → 重启服务），然后验证：
 
@@ -262,6 +263,8 @@ node --test          # 全部测试（协议转换、重试梯子、流截断、
 | `/v1/models` 为空或缺上游 | `baseURL` 需含版本段（以 `/v1` 结尾）；检查上游是否 `enabled` 且可达 |
 | DSH 插件刷新报“端点没有返回任何模型” | 插件 Go 卡只认 `go/` 前缀：确认 `opencode-go` upstream 已启用且 `prefix` 为 `go`、`apiKey` 不是占位符，且 `~/.dsh/.env` 里有 `OPENCODE_GATEWAY_KEY=<网关 token>`。详见上文「与 DSH 插件对接」 |
 | DSH 插件刷新报 `HTTP 401` | 网关 `token` 与 `~/.dsh/.env` 的 `OPENCODE_GATEWAY_KEY` 不一致；改完重启 DSH |
+| 聊天报 `403 An active OpenCode Go subscription is required` | `opencode-go` upstream 用的 `apiKey` 没有 Go 订阅。删掉该 `apiKey` 改用本机 `opencode auth login` 登录态，或换成已订阅的 Key，然后重启网关 |
+| DSH 聊天报 `Connection error.` | 网关进程没在跑（8787 无监听），不是 Key 问题。`curl http://127.0.0.1:8787/health` 应返回 `{"status":"ok"}`；没返回就通过托盘或 `start-tray-hidden.vbs` 重新拉起 |
 | DSH 插件第一次刷新为空、第二次正常 | 网关冷启动：`/v1/models` 先返回上次结果（无缓存时最多等 8 秒），后台继续读取本机后端，完成后下一次刷新即完整 |
 | 嵌入式上游首个请求很慢（10~20 秒） | opencode 实例首次初始化，属正常现象；之后恢复毫秒级 |
 | 嵌入式上游报 `Cannot connect to API` | 后端访问不了 Zen。检查 `HTTPS_PROXY` 等代理环境变量：代理客户端没跑就清空它们走直连，代理在跑就确认端口可达 |
