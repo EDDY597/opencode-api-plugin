@@ -17,7 +17,7 @@ import { buildBackendAuthHeaders } from "./backend.ts"
 
 export type LocalClient = {
   baseUrl: string
-  configProviders(): Promise<any>
+  configProviders(signal?: AbortSignal): Promise<any>
   configGet(): Promise<any>
   configUpdate(body: any): Promise<any>
   sessionCreate(body?: any): Promise<any>
@@ -106,8 +106,8 @@ export function createLocalClient(baseUrl: string, password = ""): LocalClient {
 
   return {
     baseUrl,
-    async configProviders() {
-      return call("GET", "/config/providers")
+    async configProviders(signal?: AbortSignal) {
+      return call("GET", "/config/providers", undefined, signal)
     },
     async configGet() {
       return call("GET", "/config")

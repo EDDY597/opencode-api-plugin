@@ -9,6 +9,13 @@ export const VERSION = "0.1.0"
 const USER_AGENT = `opencode-go-gateway/${VERSION}`
 const DEFAULT_PORT = 8787
 const MODELS_TTL_MS = 10 * 60 * 1000
+// /v1/models must answer promptly: clients (the DSH plugin in particular) give
+// up within ~10s, while the embedded opencode backend's provider listing can
+// take over a minute on a cold start. Serve the last good list immediately and
+// refresh it in the background; only a first-ever request waits this long
+// before answering with whatever is available.
+const MODELS_RESPONSE_WAIT_MS = 8_000
+const MODELS_FETCH_TIMEOUT_MS = 120_000
 
 // Upstream resilience defaults: retries absorb transient failures (429/5xx/
 // transport drops) with an exponential backoff; the timeout caps only the
@@ -1416,30 +1423,37 @@ function protocolFor(upstream: Upstream, model: string): Protocol {
   return upstream.protocol
 }
 
-async function fetchUpstreamModels(upstream: Upstream) {
+type ModelFetch = { ok: boolean; models: string[] }
+
+async function fetchUpstreamModels(upstream: Upstream, signal?: AbortSignal): Promise<ModelFetch> {
   if (upstream.local) {
     try {
-      return await upstream.local.listModels()
+      return { ok: true, models: await upstream.local.listModels(signal) }
     } catch {
-      return []
+      return { ok: false, models: [] }
     }
   }
-  if (upstream.models) return upstream.models
+  if (upstream.models) return { ok: true, models: upstream.models }
   try {
     const response = await fetch(`${upstream.baseURL}/models`, {
       headers: upstreamHeaders(upstream, "models"),
+      signal,
     })
     if (response.ok) {
       const json = await response.json()
       const data = Array.isArray(json) ? json : json?.data
       if (Array.isArray(data)) {
-        return data.map((item: any) => (typeof item === "string" ? item : item?.id)).filter(Boolean)
+        const models = data.map((item: any) => (typeof item === "string" ? item : item?.id)).filter(Boolean)
+        return { ok: true, models }
       }
     }
   } catch {
     void 0
   }
-  return upstream.presetOpenCodeGo ? FALLBACK_MODELS : []
+  // The preset's static catalog is a seed, not a successful read: report the
+  // failure so a later request retries, while still giving the caller something
+  // usable.
+  return { ok: false, models: upstream.presetOpenCodeGo ? FALLBACK_MODELS : [] }
 }
 
 /** Applies (or, with reverse, undoes) the upstream's modelRewrite map on a model id. */
@@ -2062,17 +2076,64 @@ export function createHandler(options: GatewayOptions = {}) {
   const upstreams = buildUpstreams(merged)
   const token = options.token ?? config.token ?? process.env.OPENCODE_GO_GATEWAY_TOKEN
   const catalogCache = new Map<string, { at: number; models: string[] }>()
+  const catalogInflight = new Map<string, Promise<ModelFetch>>()
 
-  async function catalog(force = false) {
+  /** Cache a good read; seed with a failed read only when nothing better exists. */
+  function rememberModels(upstream: Upstream, result: ModelFetch): void {
+    if (result.ok && result.models.length > 0) {
+      catalogCache.set(upstream.id, { at: Date.now(), models: result.models })
+      return
+    }
+    if (!catalogCache.has(upstream.id) && result.models.length > 0) {
+      // A preset seed, marked stale so the next request refreshes it.
+      catalogCache.set(upstream.id, { at: 0, models: result.models })
+    }
+  }
+
+  /** One shared fetch per upstream: a burst of listings refreshes once. */
+  function startModelsFetch(upstream: Upstream): Promise<ModelFetch> {
+    const existing = catalogInflight.get(upstream.id)
+    if (existing) return existing
+    const promise = fetchUpstreamModels(upstream, AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS))
+      .finally(() => catalogInflight.delete(upstream.id))
+    catalogInflight.set(upstream.id, promise)
+    return promise
+  }
+
+  /** Wait no longer than MODELS_RESPONSE_WAIT_MS; the fetch itself keeps going. */
+  function firstAnswer(pending: Promise<ModelFetch>): Promise<ModelFetch | undefined> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(undefined), MODELS_RESPONSE_WAIT_MS)
+      timer.unref?.()
+      pending.then(
+        (result) => { clearTimeout(timer); resolve(result) },
+        () => { clearTimeout(timer); resolve({ ok: false, models: [] }) },
+      )
+    })
+  }
+
+  async function catalog() {
     const groups: { name: string; prefix: string; models: string[] }[] = []
     for (const upstream of upstreams.filter((item) => item.enabled && item.baseURL)) {
       const cached = catalogCache.get(upstream.id)
-      let models: string[]
-      if (!force && cached && Date.now() - cached.at < MODELS_TTL_MS) {
-        models = cached.models
-      } else {
-        models = await fetchUpstreamModels(upstream)
-        catalogCache.set(upstream.id, { at: Date.now(), models })
+      let models: string[] | undefined = cached && Date.now() - cached.at < MODELS_TTL_MS ? cached.models : undefined
+      if (models === undefined) {
+        const pending = startModelsFetch(upstream)
+        if (cached) {
+          // Stale-while-revalidate: a warming backend never stalls the listing.
+          models = cached.models
+          void pending.then((result) => rememberModels(upstream, result), () => {})
+        } else {
+          const result = await firstAnswer(pending)
+          if (result !== undefined) {
+            rememberModels(upstream, result)
+            models = result.models
+          } else {
+            // First read is still running: answer now, cache it when it lands.
+            void pending.then((late) => rememberModels(upstream, late), () => {})
+            models = []
+          }
+        }
       }
       groups.push({ name: upstream.name, prefix: upstream.prefix, models: models.map((id) => rewriteModelId(upstream, id)) })
     }

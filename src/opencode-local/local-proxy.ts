@@ -318,7 +318,7 @@ async function getImageDataUri(url: string) {
 
 export type LocalProxy = {
   id: string
-  listModels(): Promise<string[]>
+  listModels(signal?: AbortSignal): Promise<string[]>
   handleChat(body: any, stream: boolean): Promise<Response>
   handleResponses(body: any, stream: boolean): Promise<Response>
   healthDetails(): any
@@ -354,8 +354,8 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
 
   // --- models -------------------------------------------------------------
 
-  const getProvidersList = async () => {
-    const providersRes = await client.configProviders()
+  const getProvidersList = async (signal?: AbortSignal) => {
+    const providersRes = await client.configProviders(signal)
     const providersRaw = providersRes.data?.providers || []
     return Array.isArray(providersRaw) ? providersRaw : Object.entries(providersRaw).map(([id, info]: [string, any]) => ({ ...info, id }))
   }
@@ -2326,14 +2326,12 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
 
   return {
     id: config.id,
-    async listModels() {
-      try {
-        const models = buildModelsList(await getProvidersList())
-        return models.map((m) => m.id)
-      } catch (error: any) {
-        console.error("[Local] Model Fetch Error:", error.message)
-        return ["opencode/kimi-k2.5-free"]
-      }
+    async listModels(signal?: AbortSignal) {
+      // A failed backend read is reported as a failure, never as a one-model
+      // catalog: the gateway distinguishes "endpoint has nothing" from "could
+      // not ask" and keeps serving its last good listing.
+      const models = buildModelsList(await getProvidersList(signal))
+      return models.map((m) => m.id)
     },
     handleChat,
     handleResponses,
