@@ -162,6 +162,22 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 
 只有 `free/...` 而没有 `go/...`，说明第 1–3 条没生效；请求 401 或完全为空，检查第 3–4 条与 `gateway.err.log`。
 
+### `opencode-go` 的 Key 从哪里读
+
+配置里不写 `apiKey` 时，网关按以下顺序取 Key：
+
+1. 环境变量（网关进程的环境，托盘/启动脚本会继承）：`OPENCODE_GO_API_KEY` → `OPENCODE_API_KEY` → `OPENCODE_ZEN_API_KEY`
+2. `gateway.config.json` 顶层 `apiKey` / `key` / `"opencode-go".key` / `models["opencode-go"].apiKey`
+3. 本机 `opencode auth login` 的登录态文件，依次尝试：
+   - `%OPENCODE_AUTH_FILE%`（若设置）
+   - `%XDG_DATA_HOME%\opencode\auth.json`
+   - `~/.local/share/opencode/auth.json`（本机为 `C:\Users\<你>\.local\share\opencode\auth.json`）
+   - `%APPDATA%\opencode\auth.json`
+   
+   取其中 `"opencode-go"` 条目；没有该条目时取 `"opencode"`。
+
+因此推荐顺序是：先 `opencode auth login`（`opencode auth list` 能确认当前账号），网关就不需要写 Key；要指定另一个账号时，再在 `gateway.config.json` 里加 `apiKey`，或给网关进程设 `OPENCODE_GO_API_KEY`。三者同时存在时按上面的优先级覆盖。
+
 > 免费档不需要本网关：插件内置的「OpenCode Free」路由自带 opencode2api，直接驱动本机 `opencode serve`。只有要用 Go 订阅模型时才需要上面的配置。
 
 ## 模型命名与协议路由
