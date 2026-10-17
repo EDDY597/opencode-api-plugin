@@ -6,7 +6,7 @@
 
 零依赖（仅用 Node 内置模块，无需 `npm install`），Windows 友好（脚本启动 + 系统托盘）。
 
-> **DeepSeek Harness 桌面用户**：配套插件 [EDDY597/dsh-opencode-gateway](https://github.com/EDDY597/dsh-opencode-gateway) 把本网关（订阅模型）与本机免费档一并接入 DSH 的模型菜单，自带模型管理设置页；其免费档路由内嵌 opencode2api，不依赖本网关运行。
+> **DeepSeek Harness 桌面用户**：配套插件 [EDDY597/dsh-opencode-gateway](https://github.com/EDDY597/dsh-opencode-gateway) 把本网关（订阅模型）与本机免费档一并接入 DSH 的模型菜单，自带模型管理设置页；其免费档路由内嵌 opencode2api，不依赖本网关运行。**该插件的“OpenCode Go”卡片只认 `go/` 前缀**：请把 `opencode-go` upstream 的 `prefix` 设为 `go`（示例配置已如此），并在 `~/.dsh/.env` 写入 `OPENCODE_GATEWAY_KEY=<本网关 token>`；缺任何一项，刷新时只会得到空列表。
 
 ## 解决什么问题
 
@@ -122,6 +122,47 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 | `eventIdleTimeoutMs` / `eventFirstDeltaTimeoutMs` | `8000` / `30000` | 事件流空闲/首包超时 |
 | `debug` | `false` | 调试日志 |
 
+## 与 DSH 插件对接（Go 卡）
+
+DSH 插件 [EDDY597/dsh-opencode-gateway](https://github.com/EDDY597/dsh-opencode-gateway) 的「OpenCode Go」卡并不直接展示网关的全部模型，而是只保留 **`go/` 前缀**的条目。网关侧必须让 `opencode-go` upstream 以 `go` 为前缀暴露，并让插件拿到网关 token；任何一项不对，卡片刷新就会显示「端点没有返回任何模型」。
+
+最小可用配置（`gateway.config.json`）：
+
+```json
+{
+  "hostname": "127.0.0.1",
+  "port": 8787,
+  "token": "<自己生成一个 token>",
+  "upstreams": [
+    {
+      "id": "opencode-go",
+      "name": "OpenCode Go",
+      "type": "opencode-go",
+      "prefix": "go",
+      "apiKey": "<OpenCode API Key；删掉这一行则读本机 opencode 登录态>",
+      "enabled": true
+    }
+  ]
+}
+```
+
+检查清单：
+
+1. `type` 必须是 `opencode-go`（官方端点 + 本机登录态 + 协议映射）。
+2. `prefix` 必须是 **`go`**。写成 `opencode-go` 时 `/v1/models` 会列成 `opencode-go/...`，插件的 Go 卡按设计会把它当成"本地后端目录"丢弃，刷新结果为空。
+3. `enabled` 必须是 `true`，且 `apiKey` 不能还是 `REPLACE_WITH_...` 占位符。
+4. 网关 `token` 与 `~/.dsh/.env` 的 `OPENCODE_GATEWAY_KEY` 必须一致（网关未设 token 时，后者填任意非空值）。
+5. 改完重启网关（托盘 → 重启服务），然后验证：
+
+```bash
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
+# 期望同时看到 go/... 和（若启用了嵌入式上游）free/...
+```
+
+只有 `free/...` 而没有 `go/...`，说明第 1–3 条没生效；请求 401 或完全为空，检查第 3–4 条与 `gateway.err.log`。
+
+> 免费档不需要本网关：插件内置的「OpenCode Free」路由自带 opencode2api，直接驱动本机 `opencode serve`。只有要用 Go 订阅模型时才需要上面的配置。
+
 ## 模型命名与协议路由
 
 请求里的模型名按以下顺序解析：
@@ -195,6 +236,7 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 - **参数兼容回退**：上游对 `reasoning` / `thinking` / `effort` 等参数报 400/422 时（`paramFallback: true`），自动剥离全部推理类参数重试一次。
 - **瞬断重试**：上游 429 / 5xx / 连接失败 / 首字节超时按指数退避自动重试（`retry.attempts` 次内，尊重 `Retry-After`）；鉴权、参数类永久错误首次即失败。流式响应在首字节到达前被切断会自动重放，客户端无感；开始转发后再被切断（上游掐断长连接等），以**唯一一个结构化错误帧**收尾（`code: "upstream_truncated"` + `retryable: true`），客户端可安全重跑整轮（失败轮不会写入历史，重试不会重复输出）；落在帧中间的残缺字节直接丢弃，不会发给客户端导致其解析器崩溃。
 - **空回复兜底**：非流式空回复按 `EMPTY_RESPONSE` 重试；Anthropic 流式在结尾若没有任何内容块，以协议级 `error` 事件收尾而不是返回"成功的空消息"，agent 可据此重跑。
+- **模型列表软失败**：`/v1/models` 优先返回上次成功结果并在后台刷新；首次冷启动最多等 8 秒（后端 provider 列表可能更慢），不会把“后端暂时不可用”当成真实目录缓存 10 分钟，也不会再用单个兜底模型冒充完整列表。
 
 ## 开发与测试
 
@@ -206,6 +248,8 @@ node --test          # 全部测试（协议转换、重试梯子、流截断、
 
 本地后端的测试使用假 `opencode` 二进制（.cmd 包一个小 HTTP 服务器），不需要真实 opencode 安装。
 
+> 测试会读取仓库根的 `gateway.config.json`。若那份配置设置了 `token`，测试请求会因 401 失败：跑测试前先临时清空 `token`（或移走配置），跑完恢复。
+
 ## 故障排查
 
 | 现象 | 原因与处理 |
@@ -216,6 +260,9 @@ node --test          # 全部测试（协议转换、重试梯子、流截断、
 | 上游报 `Insufficient account funds` | 账号额度不足（如免费档调付费模型），与网关无关 |
 | `/v1/responses` 返回 501 | 目标模型未声明 responses 协议；给上游加 `responsesPrefixes` 或 `responsesModels`（嵌入式上游无需，原生支持） |
 | `/v1/models` 为空或缺上游 | `baseURL` 需含版本段（以 `/v1` 结尾）；检查上游是否 `enabled` 且可达 |
+| DSH 插件刷新报“端点没有返回任何模型” | 插件 Go 卡只认 `go/` 前缀：确认 `opencode-go` upstream 已启用且 `prefix` 为 `go`、`apiKey` 不是占位符，且 `~/.dsh/.env` 里有 `OPENCODE_GATEWAY_KEY=<网关 token>`。详见上文「与 DSH 插件对接」 |
+| DSH 插件刷新报 `HTTP 401` | 网关 `token` 与 `~/.dsh/.env` 的 `OPENCODE_GATEWAY_KEY` 不一致；改完重启 DSH |
+| DSH 插件第一次刷新为空、第二次正常 | 网关冷启动：`/v1/models` 先返回上次结果（无缓存时最多等 8 秒），后台继续读取本机后端，完成后下一次刷新即完整 |
 | 嵌入式上游首个请求很慢（10~20 秒） | opencode 实例首次初始化，属正常现象；之后恢复毫秒级 |
 | 嵌入式上游报 `Cannot connect to API` | 后端访问不了 Zen。检查 `HTTPS_PROXY` 等代理环境变量：代理客户端没跑就清空它们走直连，代理在跑就确认端口可达 |
 | 嵌入式上游报 `500 {"message":"fetch failed"}`、反复"重连" | 本地 `opencode serve` 后端进程死了。`netstat -ano \| findstr :10001` 无 LISTENING 即确认。新版网关会在下个请求自动重新拉起后端（并记录退出码到日志）；旧版需重启网关 |
