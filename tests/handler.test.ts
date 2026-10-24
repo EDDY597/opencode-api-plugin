@@ -2,11 +2,14 @@
 // conversion end to end. Retry behavior gets its own file.
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { createHandler } from "../src/gateway.ts"
+import { createHandler, isLoopbackHost } from "../src/gateway.ts"
 import { startMockUpstream, type MockUpstream } from "./helpers.ts"
 
 function handlerFor(baseURL: string) {
   return createHandler({
+    // Ignore the deployment token in gateway.config.json: these tests target
+    // routing/conversion, not gateway auth.
+    token: "",
     upstreams: [{ id: "mock", name: "Mock", prefix: "m", type: "openai", baseURL, apiKey: "key-1" }],
   }).handler
 }
@@ -102,7 +105,7 @@ test("messages stream: chat SSE becomes anthropic SSE", async () => {
   }
 })
 
-test("upstream auth errors relay through once, without retry", async () => {
+test("upstream auth errors fail fast with a non-retryable account error", async () => {
   const mock: MockUpstream = await startMockUpstream(() => ({
     status: 401,
     body: JSON.stringify({ error: { message: "bad key" } }),
@@ -112,9 +115,18 @@ test("upstream auth errors relay through once, without retry", async () => {
       model: "m/x",
       messages: [{ role: "user", content: "hi" }],
     })
+    // A 401/402/403 never heals during a retry ladder, so the gateway answers once
+    // with the provider's own wording instead of burning the client's timeout.
     assert.equal(response.status, 401)
     assert.equal(mock.requests.length, 1)
-    assert.deepEqual(await response.json(), { error: { message: "bad key" } })
+    assert.deepEqual(await response.json(), {
+      error: {
+        message: "bad key (model x)",
+        type: "invalid_request_error",
+        code: "UPSTREAM_ACCOUNT_ERROR",
+        retryable: false,
+      },
+    })
   } finally {
     await mock.close()
   }
@@ -146,4 +158,61 @@ test("missing model is rejected without touching the upstream", async () => {
   } finally {
     await mock.close()
   }
+})
+
+test("an empty token serves /v1 without any Authorization header", async () => {
+  const mock: MockUpstream = await startMockUpstream(() => ({
+    status: 200,
+    body: JSON.stringify({ id: "c1", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }),
+  }))
+  try {
+    const response = await post(handlerFor(mock.baseURL), "/v1/chat/completions", {
+      model: "m/x",
+      messages: [{ role: "user", content: "hi" }],
+    })
+    // No key configured: the gateway must not invent an auth requirement.
+    assert.equal(response.status, 200)
+  } finally {
+    await mock.close()
+  }
+})
+
+test("a configured token rejects a missing or wrong Bearer value", async () => {
+  const handler = createHandler({
+    token: "secret-1",
+    upstreams: [{ id: "mock", name: "Mock", prefix: "m", type: "openai", baseURL: "http://127.0.0.1:1", apiKey: "k" }],
+  }).handler
+  const unauth = await handler(new Request("http://gw/v1/models"))
+  assert.equal(unauth.status, 401)
+  const wrong = await handler(new Request("http://gw/v1/models", { headers: { authorization: "Bearer nope" } }))
+  assert.equal(wrong.status, 401)
+})
+
+test("a token resolves from the environment when the passed value is empty", () => {
+  const previous = process.env.OPENCODE_GO_GATEWAY_TOKEN
+  process.env.OPENCODE_GO_GATEWAY_TOKEN = "from-env"
+  try {
+    const handler = createHandler({
+      upstreams: [{ id: "mock", name: "Mock", prefix: "m", type: "openai", baseURL: "http://127.0.0.1:1", apiKey: "k" }],
+    }).handler
+    // Async guard: the handler must answer 401 before it ever reaches the upstream.
+    return handler(new Request("http://gw/v1/models")).then((response) => {
+      assert.equal(response.status, 401)
+    })
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_GO_GATEWAY_TOKEN
+    else process.env.OPENCODE_GO_GATEWAY_TOKEN = previous
+  }
+})
+
+test("loopback detection gates the empty-token shortcut", () => {
+  assert.equal(isLoopbackHost("127.0.0.1"), true)
+  assert.equal(isLoopbackHost("127.8.9.10"), true)
+  assert.equal(isLoopbackHost("localhost"), true)
+  assert.equal(isLoopbackHost("::1"), true)
+  assert.equal(isLoopbackHost("[::1]"), true)
+  assert.equal(isLoopbackHost("0.0.0.0"), false)
+  assert.equal(isLoopbackHost("192.168.1.10"), false)
+  assert.equal(isLoopbackHost(""), false) // empty host binds every interface
+  assert.equal(isLoopbackHost("example.com"), false)
 })

@@ -1,6 +1,7 @@
 {
   "hostname": "127.0.0.1",
   "port": 8787,
+  "_token_note": "Empty means no auth: /v1 accepts requests without a header. Only allowed while hostname is loopback; the gateway refuses to start otherwise.",
   "token": "",
   "upstreams": [
     {

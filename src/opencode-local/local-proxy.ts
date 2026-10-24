@@ -57,6 +57,7 @@ export type LocalProxyConfig = {
   promptMode: string
   omitSystemPrompt: boolean
   zenApiKey?: string
+  preferAuthFile: boolean
   autoCleanupConversations: boolean
   cleanupIntervalMs: number
   cleanupMaxAgeMs: number
@@ -99,6 +100,9 @@ export function normalizeLocalProxyConfig(raw: any): LocalProxyConfig {
     promptMode,
     omitSystemPrompt: normalizeBool(raw.omitSystemPrompt) ?? normalizeBool(process.env.OPENCODE_PROXY_OMIT_SYSTEM_PROMPT) ?? promptMode === "plugin-inject",
     zenApiKey: raw.zenApiKey ?? process.env.OPENCODE_ZEN_API_KEY ?? "",
+    // Default on: a login in auth.json beats a configured zenApiKey, so the proxy
+    // behaves like the `opencode` CLI unless the operator opts out.
+    preferAuthFile: normalizeBool(raw.preferAuthFile) ?? true,
     autoCleanupConversations: normalizeBool(raw.autoCleanupConversations, false)!,
     cleanupIntervalMs: Number(raw.cleanupIntervalMs ?? process.env.OPENCODE_PROXY_CLEANUP_INTERVAL_MS) || 12 * 60 * 60 * 1000,
     cleanupMaxAgeMs: Number(raw.cleanupMaxAgeMs ?? process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || 24 * 60 * 60 * 1000,
@@ -1130,6 +1134,7 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
       opencodePath: config.opencodePath,
       useIsolatedHome: config.useIsolatedHome,
       zenApiKey: config.zenApiKey,
+      preferAuthFile: config.preferAuthFile,
       serverPassword: config.serverPassword,
       manageBackend: config.manageBackend,
       promptMode: PROMPT_MODE,

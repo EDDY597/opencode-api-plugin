@@ -10,6 +10,9 @@ const CHAT_OK = { id: "c1", object: "chat.completion", choices: [{ message: { co
 
 function handlerFor(baseURL: string, extra: Record<string, unknown> = {}) {
   return createHandler({
+    // Ignore the deployment token in gateway.config.json: these tests exercise
+    // retry behavior, not gateway auth.
+    token: "",
     upstreams: [{ id: "mock", prefix: "m", type: "openai", baseURL, apiKey: "key-1", ...extra }],
   }).handler
 }
@@ -215,3 +218,58 @@ test("auth failures are never retried even with attempts left", async () => {
     await mock.close()
   }
 })
+
+// OpenCode Go returns the same "Endpoint is unavailable" body with a shifting
+// status (429/422/503); the 422 variant must be retried, not blamed on the
+// request payload.
+const UNAVAILABLE = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: Endpoint is unavailable." } })
+
+test("422 'Endpoint is unavailable': retried, then the retry succeeds", async () => {
+  const mock: MockUpstream = await startMockUpstream((request, _body, hit) => {
+    if (hit === 1) return { status: 422, body: UNAVAILABLE }
+    if (!request.url.endsWith("/chat/completions")) return { status: 422, body: UNAVAILABLE }
+    return { status: 200, body: JSON.stringify(CHAT_OK) }
+  })
+  try {
+    const response = await post(handlerFor(mock.baseURL, { retry: { attempts: 3, maxDelayMs: 50 } }), CHAT_BODY)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), CHAT_OK)
+    // First chat attempt, the failed /responses fallback, then the successful retry.
+    assert.equal(mock.requests.length, 3)
+    assert.equal(mock.requests.filter((r) => r.url.endsWith("/chat/completions")).length, 2)
+  } finally {
+    await mock.close()
+  }
+})
+
+test("422 'Endpoint is unavailable' exhausted: 503 UPSTREAM_UNAVAILABLE, never a 422", async () => {
+  const mock: MockUpstream = await startMockUpstream(() => ({ status: 422, body: UNAVAILABLE }))
+  try {
+    const response = await post(handlerFor(mock.baseURL, { retry: { attempts: 3, maxDelayMs: 50 } }), CHAT_BODY)
+    assert.equal(response.status, 503)
+    const payload = await response.json()
+    assert.equal(payload.error.code, "UPSTREAM_UNAVAILABLE")
+    assert.equal(payload.error.retryable, true)
+    assert.match(payload.error.message, /temporarily unavailable/i)
+    // Three ladder attempts; the first also tries the /responses fallback.
+    assert.equal(mock.requests.filter((r) => r.url.endsWith("/chat/completions")).length, 3)
+  } finally {
+    await mock.close()
+  }
+})
+
+test("a genuine 422 param error is still a client error, not 'unavailable'", async () => {
+  const mock: MockUpstream = await startMockUpstream((_request, body, hit) => {
+    if (hit === 1) return { status: 422, body: JSON.stringify({ error: { message: "Unsupported parameter: reasoning_effort" } }) }
+    assert.equal(JSON.parse(body).reasoning_effort, undefined)
+    return { status: 200, body: JSON.stringify(CHAT_OK) }
+  })
+  try {
+    const response = await post(handlerFor(mock.baseURL, { retry: { attempts: 1 } }), { ...CHAT_BODY, reasoning_effort: "high" })
+    assert.equal(response.status, 200)
+    assert.equal(mock.requests.length, 2)
+  } finally {
+    await mock.close()
+  }
+})
+

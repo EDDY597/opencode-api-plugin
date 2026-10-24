@@ -36,7 +36,8 @@
 ```bash
 # 1. 准备配置
 cp gateway.config.example.json gateway.config.json
-#    编辑 gateway.config.json：设置 token，填上游的 apiKey
+#    编辑 gateway.config.json：填上游的 apiKey；
+#    token 留空即网关免鉴权（仅限 hostname 为回环地址），想让客户端"不填 key"就保持为空
 
 # 2. 启动
 start-tray-hidden.vbs          # 托盘模式（推荐，可配置为开机自启）
@@ -44,7 +45,8 @@ start-gateway.cmd              # 前台窗口，可看日志（调试用；注�
 start-gateway-hidden.vbs       # 裸网关静默后台运行（无托盘监管，一般不用）
 
 # 3. 验证
-curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
+curl http://127.0.0.1:8787/v1/models
+#    token 非空时：curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 ```
 
 ## 系统托盘
@@ -72,10 +74,12 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 
 | 字段 | 默认 | 说明 |
 |:-----|:-----|:-----|
-| `hostname` | `127.0.0.1` | 监听地址 |
+| `hostname` | `127.0.0.1` | 监听地址。**保持回环**：`token` 为空时网关拒绝在非回环地址上启动（见下） |
 | `port` | `8787` | 监听端口 |
-| `token` | (空) | 网关自身的 Bearer 鉴权；设置后所有 `/v1/*` 请求必须携带 |
+| `token` | (空) | 网关自身的 Bearer 鉴权；设置后所有 `/v1/*` 请求必须携带。**留空即免鉴权**，客户端不必填 Key |
 | `upstreams` | 内置 OpenCode Go 预设 | 上游列表，见下表 |
+
+> **空 token 的安全约束**：`token` 为空时，任何能连到端口的人都等于拥有你的模型额度。因此 `hostname` 不是回环（`127.0.0.1` / `localhost` / `::1`）时会**直接拒绝启动**并报 `TOKEN_REQUIRED`。想监听 `0.0.0.0` 或局域网地址，必须同时设置 `token`。
 
 `upstreams[]` 字段：
 
@@ -111,7 +115,8 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
 | `opencodePath` | `opencode` | opencode 可执行文件路径（找不到时按 PATH 与常见安装位置自动搜索） |
 | `manageBackend` | `true` | 后端不在时自动 spawn `opencode serve`，随网关退出而关闭 |
 | `serverPassword` | (空) | 后端 Basic Auth 密码（经 `OPENCODE_SERVER_PASSWORD` 环境变量传给后端） |
-| `zenApiKey` | (空) | 透传为后端的 `OPENCODE_API_KEY`（解锁付费模型） |
+| `zenApiKey` | (空) | 透传为后端的 `OPENCODE_API_KEY`（解锁付费模型）。**默认会被本机登录态覆盖**，见下一行 |
+| `preferAuthFile` | `true` | 为 `true` 且 `~/.local/share/opencode/auth.json` 已有 opencode 登录态时，**忽略 `zenApiKey`**，让后端沿用 CLI 的账号。可避免"CLI 能用、网关报额度不足"的身份错位 |
 | `disableTools` | `true` | 禁用 OpenCode 内置工具（经 tool-lock 插件执行，免费档必需） |
 | `internalAllowedTools` | (空) | 内置工具白名单（逗号分隔或数组） |
 | `promptMode` | `standard` | `standard` 或 `plugin-inject` |
@@ -156,7 +161,8 @@ DSH 插件 [EDDY597/dsh-opencode-gateway](https://github.com/EDDY597/dsh-opencod
 5. 改完重启网关（托盘 → 重启服务），然后验证：
 
 ```bash
-curl -H "Authorization: Bearer <token>" http://127.0.0.1:8787/v1/models
+curl http://127.0.0.1:8787/v1/models
+# token 非空时加 -H "Authorization: Bearer <token>"
 # 期望同时看到 go/... 和（若启用了嵌入式上游）free/...
 ```
 
@@ -228,8 +234,9 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 ```
 
 - 首次请求后端会自动拉起（实例初始化约 10~20 秒，之后恢复毫秒级）；网关退出时自动关闭后端。
-- 客户端接入：地址 `http://127.0.0.1:8787/v1`，密钥为网关 `token`，模型名如 `free/opencode/space-bunny-free`。
+- 客户端接入：地址 `http://127.0.0.1:8787/v1`，模型名如 `free/opencode/space-bunny-free`。**网关 `token` 为空时客户端不需要填任何 Key**（任意占位符或不填均可）；`token` 非空时才需要填那个 token。
 - 三种协议端点 + 流式均已实测打通；仅免费档模型可用，付费模型会由上游报 `Insufficient account funds`。
+- **账号身份**：默认沿用 `opencode auth login` 的登录态（`preferAuthFile`），所以网关与 CLI 的可用模型、额度完全一致。不要把别的账号 Key 填进 `zenApiKey`，除非确实想切换身份。
 - 代理：后端与云端上游都靠 `HTTPS_PROXY` 等环境变量出网。Node 的 `fetch` 默认不读这些变量，三个启动入口（两个 start 脚本 + 托盘）已固定设 `NODE_USE_ENV_PROXY=1`，环境里有代理变量即自动生效。DNS 被污染时直连会报 `self signed certificate` / `Unable to connect`，此时必须走代理。
 
 也可改为传统部署：单独运行 opencode2api 服务，然后用 `type: "openai"` + `baseURL` 指向它，效果等同。
@@ -252,6 +259,9 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 - **会话与推理缓存**：DeepSeek 类模型的 `reasoning_content` 按 `x-opencode-session` 会话缓存（LRU 200），并在后续请求中回注到 messages，保证多轮推理连续性。
 - **参数兼容回退**：上游对 `reasoning` / `thinking` / `effort` 等参数报 400/422 时（`paramFallback: true`），自动剥离全部推理类参数重试一次。
 - **瞬断重试**：上游 429 / 5xx / 连接失败 / 首字节超时按指数退避自动重试（`retry.attempts` 次内，尊重 `Retry-After`）；鉴权、参数类永久错误首次即失败。流式响应在首字节到达前被切断会自动重放，客户端无感；开始转发后再被切断（上游掐断长连接等），以**唯一一个结构化错误帧**收尾（`code: "upstream_truncated"` + `retryable: true`），客户端可安全重跑整轮（失败轮不会写入历史，重试不会重复输出）；落在帧中间的残缺字节直接丢弃，不会发给客户端导致其解析器崩溃。
+- **上游端点抖动（"Endpoint is unavailable"）**：OpenCode Go 对同一次后端不可用会随缘返回 429 / 422 / 503，响应体都是 `Upstream request failed: Endpoint is unavailable.`。按状态码分类会把 422 当成立即失败的参数错误，用户直接看到一次没重试的 422。网关改为**按响应体识别**该条件：无论状态码一律按瞬断走重试梯子（先试 `/responses` 备用协议，再退避重试）；重试预算耗尽后返回 **503 `UPSTREAM_UNAVAILABLE` + `retryable: true`**（并带上游原始原因），而不是把 422 甩给客户端。遇到时重跑整轮或换一个 Go 模型即可，额度并未扣错。
+- **账户类错误快速失败**：`401` / `402` / `403`，以及响应体命中 `insufficient funds` / `free usage limit reached` / `quota exceeded` / `billing` / `not available in your country` 时，网关**不走重试梯子**，也不做 `/responses` 协议回退，立即返回 `UPSTREAM_ACCOUNT_ERROR` + `retryable: false`，并带上游原文（如 `Free usage limit reached. Subscribe to OpenCode Go`）。这类错误在一次请求内不会自愈，重试只会把客户端的整个超时耗光，最后伪装成"网关超时"。
+- **账号身份优先级**：嵌入式上游只要配了 `zenApiKey` 就会注入 `OPENCODE_API_KEY`，覆盖掉 `opencode auth login` 的登录态——这会让人困惑："CLI 直接跑好好的，走网关就报额度不足"。`preferAuthFile`（默认 `true`）让 `auth.json` 里的登录态优先，网关与 CLI 行为保持一致。
 - **空回复兜底**：非流式空回复按 `EMPTY_RESPONSE` 重试；Anthropic 流式在结尾若没有任何内容块，以协议级 `error` 事件收尾而不是返回"成功的空消息"，agent 可据此重跑。
 - **模型列表软失败**：`/v1/models` 优先返回上次成功结果并在后台刷新；首次冷启动最多等 8 秒（后端 provider 列表可能更慢），不会把“后端暂时不可用”当成真实目录缓存 10 分钟，也不会再用单个兜底模型冒充完整列表。
 
@@ -265,7 +275,7 @@ node --test          # 全部测试（协议转换、重试梯子、流截断、
 
 本地后端的测试使用假 `opencode` 二进制（.cmd 包一个小 HTTP 服务器），不需要真实 opencode 安装。
 
-> 测试会读取仓库根的 `gateway.config.json`。若那份配置设置了 `token`，测试请求会因 401 失败：跑测试前先临时清空 `token`（或移走配置），跑完恢复。
+> 测试会读取仓库根的 `gateway.config.json`。测试用例显式传 `token: ""` 关闭鉴权，因此配置里设了 `token` 也不会导致 401；但**网关不会**在"空 token + 非回环地址"下启动，配置成那样时相关用例会抛 `TOKEN_REQUIRED`。
 
 ## 故障排查
 
@@ -274,12 +284,18 @@ node --test          # 全部测试（协议转换、重试梯子、流截断、
 | `Port 8787 is already in use` | 已有实例在跑。换 `port`，或按端口找到 PID 结束：`netstat -ano \| findstr :8787` |
 | 启动即报语法/加载错误 | Node 版本低于 22.6，无法原生运行 `.ts`。升级 Node 或改用高版本完整路径 |
 | 上游 401 | `apiKey` 与上游不匹配 |
-| 上游报 `Insufficient account funds` | 账号额度不足（如免费档调付费模型），与网关无关 |
+| 上游报 `Insufficient account funds` | 账号额度不足（如免费档调付费模型），与网关无关。网关现在会**立即**返回 `UPSTREAM_ACCOUNT_ERROR`（不再重试到客户端超时） |
+| 走网关报额度不足，但 `opencode` CLI 直接跑正常 | 配置里的 `zenApiKey` 顶掉了 `auth.json` 的登录态。清空 `zenApiKey`，或保持 `preferAuthFile: true`（默认）。网关日志会打印 `auth.json is present; ignoring configured zenApiKey` |
+| 一直卡到客户端超时、拿不到任何报错 | 先看是不是被重试放大的永久错误：查 `gateway.err.log` 与 opencode 日志（`~/.local/share/opencode/log/opencode.log`）里的 `AI_APICallError`。另外确认后端没卡在 `bootstrapping`：健康的 `/global/health` 不代表业务接口可用，`curl http://127.0.0.1:10001/session` 应在数百毫秒内返回 |
+| 后端反复 `bootstrapping`、每次约 70 秒 | opencode 在等一次必然失败的依赖安装。检查 `~/.npmrc` 的 `registry`——`registry.npm.taobao.org` 的证书已过期，换成 `https://registry.npmmirror.com/` 后重启后端 |
+| 无 Key 访问 `/v1` 返回 `401 Invalid gateway token` | 配置里 `token` 非空。想免鉴权就把 `token` 设为 `""`（`hostname` 必须是回环） |
+| 启动报 `TOKEN_REQUIRED` | `token` 为空却监听在非回环地址。设 `token`，或把 `hostname` 改回 `127.0.0.1` |
 | `/v1/responses` 返回 501 | 目标模型未声明 responses 协议；给上游加 `responsesPrefixes` 或 `responsesModels`（嵌入式上游无需，原生支持） |
 | `/v1/models` 为空或缺上游 | `baseURL` 需含版本段（以 `/v1` 结尾）；检查上游是否 `enabled` 且可达 |
 | DSH 插件刷新报“端点没有返回任何模型” | 插件 Go 卡只认 `go/` 前缀：确认 `opencode-go` upstream 已启用且 `prefix` 为 `go`、`apiKey` 不是占位符，且 `~/.dsh/.env` 里有 `OPENCODE_GATEWAY_KEY=<网关 token>`。详见上文「与 DSH 插件对接」 |
 | DSH 插件刷新报 `HTTP 401` | 网关 `token` 与 `~/.dsh/.env` 的 `OPENCODE_GATEWAY_KEY` 不一致；改完重启 DSH |
 | 聊天报 `403 An active OpenCode Go subscription is required` | `opencode-go` upstream 用的 `apiKey` 没有 Go 订阅。删掉该 `apiKey` 改用本机 `opencode auth login` 登录态，或换成已订阅的 Key，然后重启网关 |
+| 聊天报 `422` / `429` `Upstream request failed: Endpoint is unavailable.` | OpenCode Go 服务端该模型的路由暂时不可用（不是你的配置、网络或额度问题；同一 Key 换个模型往往立刻可用）。新版网关会识别并重试，预算耗尽后转为 `503 UPSTREAM_UNAVAILABLE`；过几秒重跑整轮或换模型即可。可用 `curl` 直连 `https://opencode.ai/zen/go/v1/chat/completions` 复现/排除网关因素 |
 | DSH 聊天报 `Connection error.` | 网关进程没在跑（8787 无监听），不是 Key 问题。`curl http://127.0.0.1:8787/health` 应返回 `{"status":"ok"}`；没返回就通过托盘或 `start-tray-hidden.vbs` 重新拉起 |
 | DSH 插件第一次刷新为空、第二次正常 | 网关冷启动：`/v1/models` 先返回上次结果（无缓存时最多等 8 秒），后台继续读取本机后端，完成后下一次刷新即完整 |
 | 嵌入式上游首个请求很慢（10~20 秒） | opencode 实例首次初始化，属正常现象；之后恢复毫秒级 |

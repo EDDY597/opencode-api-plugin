@@ -1735,6 +1735,54 @@ function classifyFailure(status: number): FailureCode | undefined {
   return undefined
 }
 
+/**
+ * OpenCode Go's provider routes answer the same unavailable-backend condition
+ * with a shifting status (429, 422 or 503) and always the body "Upstream
+ * request failed: Endpoint is unavailable." Classifying by status alone treats
+ * the 422 variant as a permanent client error, so a transient upstream hiccup
+ * reaches the user as an unretried 422. Match the body as well: whatever the
+ * status, this is the upstream telling us the route is momentarily gone.
+ */
+export function isTransientUnavailable(status: number, text: string) {
+  return status >= 400 && /endpoint is unavailable/i.test(text)
+}
+
+/**
+ * True for addresses that only the local machine can reach. An empty token is only
+ * safe behind one of these; anything else would expose the operator's model quota to
+ * the network, so `createHandler` refuses to start.
+ */
+export function isLoopbackHost(hostname: string | undefined) {
+  const host = (hostname ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "")
+  // An empty host makes Node bind all interfaces, so it is not loopback.
+  if (!host) return false
+  return host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+}
+
+/** Pull a human-readable reason out of an upstream error body. */
+function upstreamErrorDetail(text: string) {
+  try {
+    const json = JSON.parse(text)
+    const message = json?.error?.message ?? json?.message
+    if (typeof message === "string" && message.trim()) return message.trim()
+  } catch {
+    void 0
+  }
+  return text.trim().slice(0, 300)
+}
+
+/**
+ * Account problems are permanent for this request: the key is out of funds, out of
+ * free quota, or not entitled to the model. Retrying spends the client's whole
+ * timeout and then reports a generic "timeout", which is why an unpaid key looked
+ * like a slow gateway. Match the bodies we have seen rather than the status alone —
+ * providers wrap these as 400, 402, 403 or 429 with wildly different codes.
+ */
+export function isFatalUpstreamError(status: number, text: string) {
+  if (status === 401 || status === 402 || status === 403) return true
+  return /insufficient (account )?(funds|balance|credits)|free usage limit reached|quota exceeded|billing|not available in your country/i.test(text)
+}
+
 /** Honor Retry-After when present, clamped to the configured delay ceiling. */
 function retryAfterMs(headers: Headers | undefined, maxDelayMs: number): number | undefined {
   const raw = headers?.get("retry-after")
@@ -1809,8 +1857,11 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
   let lastStatus = 502
   let lastType = "application/json"
   let lastText = ""
+  let unavailable = false
+  let tries = 0
 
   while (true) {
+    tries += 1
     let response: Response
     try {
       response = await sendOnce(upstream, protocol, pending, stream, model, headers, session)
@@ -1893,8 +1944,9 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
     const lastHeaders = response.headers
     lastText = await response.text()
     debugLog(`<-- ${lastStatus} ${lastText.slice(0, 4000)}`)
+    unavailable = isTransientUnavailable(lastStatus, lastText)
 
-    if (protocol === "openai" && !altProtocol && /not supported for format oa-compat|Endpoint is unavailable/i.test(lastText)) {
+    if (protocol === "openai" && !altProtocol && !isFatalUpstreamError(lastStatus, lastText) && (/not supported for format oa-compat/i.test(lastText) || unavailable)) {
       altProtocol = true
       const alt = await sendOnce(upstream, "responses", pending, stream, model, headers, session)
       if (alt.ok) {
@@ -1904,6 +1956,7 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
       lastStatus = alt.status
       lastType = alt.headers.get("content-type") ?? "application/json"
       lastText = await alt.text()
+      unavailable = isTransientUnavailable(lastStatus, lastText)
       debugLog(`<-- ${lastStatus} (responses fallback) ${lastText.slice(0, 4000)}`)
       // Note: lastHeaders stays the original response's — close enough for
       // Retry-After purposes and irrelevant once we fall through to strip/retry.
@@ -1918,7 +1971,26 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
       }
     }
 
-    const code = classifyFailure(lastStatus)
+    const fatal = isFatalUpstreamError(lastStatus, lastText)
+    if (fatal) {
+      // Account/quota/entitlement problems do not heal within a retry ladder. Fail
+      // now with the provider's own wording so "key has no balance" is visible
+      // immediately instead of surfacing as a client-side timeout.
+      debugLog(`<-- ${lastStatus} fatal (not retrying) ${lastText.slice(0, 400)}`)
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: `${upstreamErrorDetail(lastText)} (model ${model})`,
+            type: "invalid_request_error",
+            code: "UPSTREAM_ACCOUNT_ERROR",
+            retryable: false,
+          },
+        }),
+        { status: lastStatus >= 400 ? lastStatus : 402, headers: { "content-type": "application/json", ...CORS } },
+      )
+    }
+
+    const code = classifyFailure(lastStatus) ?? (unavailable ? "SERVER" : undefined)
     if (code && attempt + 1 < attempts) {
       attempt += 1
       const delay = retryAfterMs(lastHeaders, upstream.retryMaxDelayMs) ?? backoffDelay(attempt - 1, upstream.retryMaxDelayMs)
@@ -1926,6 +1998,24 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
       continue
     }
     break
+  }
+
+  if (unavailable) {
+    // Every retry hit the same "endpoint unavailable" wall. Relaying the
+    // upstream's own 422 told clients the request was malformed, which is both
+    // wrong and untreatable; a 503 with a retryable code lets them back off and
+    // try again (or switch models) instead of blaming the payload.
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: `Upstream endpoint is temporarily unavailable for ${model} after ${tries} attempt(s): ${upstreamErrorDetail(lastText)} Retry the turn in a few seconds or switch models.`,
+          type: "api_error",
+          code: "UPSTREAM_UNAVAILABLE",
+          retryable: true,
+        },
+      }),
+      { status: 503, headers: { "content-type": "application/json", ...CORS } },
+    )
   }
 
   return new Response(lastText, { status: lastStatus, headers: { "content-type": lastType, ...CORS } })
@@ -2074,7 +2164,18 @@ export function createHandler(options: GatewayOptions = {}) {
   const config = loadFileConfig() ?? {}
   const merged = { ...config, ...options, upstreams: options.upstreams ?? config.upstreams }
   const upstreams = buildUpstreams(merged)
-  const token = options.token ?? config.token ?? process.env.OPENCODE_GO_GATEWAY_TOKEN
+  const hostname = options.hostname ?? process.env.OPENCODE_GO_GATEWAY_HOST ?? config.hostname ?? "127.0.0.1"
+  // An explicit empty string means "no auth"; only `undefined` falls through to the
+  // env/config, so `createHandler({ token: "" })` actually disables the check.
+  const token = (options.token ?? process.env.OPENCODE_GO_GATEWAY_TOKEN ?? config.token ?? "").trim()
+  if (!token && !isLoopbackHost(hostname)) {
+    // Without a token every caller that can reach the port is trusted, so a non-loopback
+    // bind would turn the gateway into an open proxy for the operator's model quota.
+    throw new UsageError(
+      `Refusing to listen on ${hostname} without a token: set "token" in gateway.config.json or bind 127.0.0.1.`,
+      "TOKEN_REQUIRED",
+    )
+  }
   const catalogCache = new Map<string, { at: number; models: string[] }>()
   const catalogInflight = new Map<string, Promise<ModelFetch>>()
 
@@ -2301,10 +2402,13 @@ export function createHandler(options: GatewayOptions = {}) {
 }
 
 export function createGateway(options: GatewayOptions = {}) {
-  const hostname = options.hostname ?? process.env.OPENCODE_GO_GATEWAY_HOST ?? "127.0.0.1"
   const parsedPort = options.port ?? Number(process.env.OPENCODE_GO_GATEWAY_PORT ?? DEFAULT_PORT)
   const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : DEFAULT_PORT
   const { handler } = createHandler(options)
+  // The handler resolved the real hostname (options → env → config file); use the same
+  // value here so a `hostname` in gateway.config.json is honoured instead of silently
+  // listening on 127.0.0.1.
+  const hostname = options.hostname ?? process.env.OPENCODE_GO_GATEWAY_HOST ?? loadFileConfig()?.hostname ?? "127.0.0.1"
 
   try {
     const server = Bun.serve({ hostname, port, fetch: handler })

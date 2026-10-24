@@ -24,6 +24,9 @@ const FULL = HEAD + TAIL
 
 function handlerFor(baseURL: string, extra: Record<string, unknown> = {}) {
   return createHandler({
+    // Ignore the deployment token in gateway.config.json: these tests target
+    // stream truncation, not gateway auth.
+    token: "",
     upstreams: [{ id: "mock", name: "Mock", prefix: "m", type: "openai", baseURL, apiKey: "key-1", ...extra }],
   }).handler
 }

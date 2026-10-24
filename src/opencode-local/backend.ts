@@ -229,10 +229,23 @@ export type EnsureBackendConfig = {
   opencodePath: string
   useIsolatedHome: boolean
   zenApiKey?: string
+  preferAuthFile?: boolean
   serverPassword?: string
   manageBackend: boolean
   promptMode: string
   toolLockPluginPath: string
+}
+
+/** True when OpenCode's own credential store already holds a login for `provider`. */
+export function authFileHasProvider(provider: string, home = os.homedir()) {
+  try {
+    const raw = fs.readFileSync(path.join(home, ".local", "share", "opencode", "auth.json"), "utf8")
+    const parsed = JSON.parse(raw)
+    const entry = parsed?.[provider]
+    return Boolean(entry && typeof entry === "object" && (entry.key || entry.access))
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -264,6 +277,7 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
     opencodePath,
     useIsolatedHome,
     zenApiKey,
+    preferAuthFile = true,
     serverPassword,
     manageBackend,
     promptMode,
@@ -327,7 +341,20 @@ async function ensureBackendInternal(config: EnsureBackendConfig, state: Backend
       OPENCODE_CONFIG_CONTENT: buildBackendConfigContent(process.env.OPENCODE_CONFIG_CONTENT, toolLockPluginPath),
     }
     if (serverPassword) backendEnv.OPENCODE_SERVER_PASSWORD = serverPassword
-    if (zenApiKey) backendEnv.OPENCODE_API_KEY = zenApiKey
+
+    // A configured zenApiKey is an explicit override of the account the CLI is
+    // logged in as (`auth.json`), which is why it wins by default. But injecting it
+    // when the operator only meant "use my normal login" silently swaps identities:
+    // free models then fail with "Insufficient account funds" / "Free usage limit
+    // reached" while `opencode` run by hand works fine. Make the precedence
+    // explicit — prefer the auth file unless the operator asks otherwise.
+    if (zenApiKey) {
+      if (preferAuthFile && authFileHasProvider("opencode")) {
+        console.log("[Local] auth.json is present; ignoring configured zenApiKey (preferAuthFile)")
+      } else {
+        backendEnv.OPENCODE_API_KEY = zenApiKey
+      }
+    }
 
     const isWindows = process.platform === "win32"
     const salt = Math.random().toString(36).substring(7)
