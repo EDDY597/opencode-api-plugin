@@ -184,7 +184,7 @@ curl http://127.0.0.1:8787/v1/models
 
 因此推荐顺序是：先 `opencode auth login`（`opencode auth list` 能确认当前账号），网关就不需要写 Key；要指定另一个账号时，再在 `gateway.config.json` 里加 `apiKey`，或给网关进程设 `OPENCODE_GO_API_KEY`。三者同时存在时按上面的优先级覆盖。
 
-> 免费档不需要本网关：插件内置的「OpenCode Free」路由自带 opencode2api，直接驱动本机 `opencode serve`。只有要用 Go 订阅模型时才需要上面的配置。
+> 免费档当前由 `bin\` 下的 Go 版 [opencode2api](https://github.com/jasonxu114514/opencode2api) 服务提供（启动脚本自动拉起，详见下文「实战：免费模型」），Go 订阅模型才需要上面的配置。
 
 ## 模型命名与协议路由
 
@@ -212,15 +212,43 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/usage` | 聚合配置了 `usageBase` 的上游额度 |
 
-## 实战：免费模型（嵌入式 opencode2api）
+## 实战：免费模型（Go 版 opencode2api）
 
-内置的嵌入式上游移植自 [opencode2api](https://github.com/TiaraBasori/opencode2api)（MIT，见 `plugin/` 内的许可副本）：驱动本机 opencode 运行时访问 OpenCode Zen 免费模型，无需单独安装或启动任何其他服务。前置条件只有一个——本机装有 opencode CLI（`npm install -g opencode-ai`），建议先 `opencode auth login` 登录免费账号（模型列表与限额都更好，匿名也能用）。
+免费档当前走 `bin\` 下的 [opencode2api](https://github.com/jasonxu114514/opencode2api)（Go，MIT）独立服务。2026-10 起 OpenCode 收紧了免费档的客户端检测：裸 API 调用直接 403 `FreeTierError`（free tier can only be used from within OpenCode），并按出口 IP 统计免费额度，打满后返回 429 `Free usage limit reached` 且间隔性恢复。该服务以完整客户端保真度访问上游——Bun TLS 指纹（uTLS 复刻 ClientHello）、OpenCode 2.1 版本号与 `/inference` 路由、逐字节对齐请求体——并支持多出口轮换、单出口打满后冷却 15 分钟（`free_tier_block_seconds`）、匿名通道（无需任何账号，`anonymous: true`）。
+
+`bin\config.json`（服务自身配置，已被 .gitignore 忽略）：
+
+- `listen`: `127.0.0.1:18080`；`server_keys`: 客户端访问本服务用的本地 Key。
+- `proxies`: 出口池，示例 `["direct", "http://127.0.0.1:7897"]`；出口被打满会冷却并轮换到下一个，额度恢复后自动回归。
+- `zen_keys`: 可选填 Zen Key（如 `~/.local/share/opencode/auth.json` 里 `opencode` 条目的 `oc_sk_` Key）走账号身份；匿名通道与账号通道的免费额度相互独立，服务会自动在多条通道间重试。
+- `models.free_only: true`：只暴露免费模型，与网关的 `free` 前缀对应。
 
 `gateway.config.json`：
 
 ```json
 {
-  "id": "local-free",
+  "id": "free-opencode2api",
+  "name": "OpenCode Free (opencode2api Go)",
+  "type": "openai",
+  "prefix": "free",
+  "baseURL": "http://127.0.0.1:18080/v1",
+  "apiKey": "<bin/config.json server_keys 中的一项>",
+  "protocol": "openai",
+  "enabled": true
+}
+```
+
+- 启动：`start-gateway.cmd` / `start-gateway-hidden.vbs` 会先检测 18080 端口，没有监听就拉起服务（自身管理代理出口，不需要网关的 `HTTP(S)_PROXY`）；`stop-gateway.ps1` 会把它一并停止。
+- 客户端接入：地址 `http://127.0.0.1:8787/v1`，模型名如 `free/glm-5.3-flash-free`。**注意模型名没有 `opencode/` 段**——Go 服务直接使用上游模型 ID，与旧嵌入式上游的 `free/opencode/…` 命名不同。**网关 `token` 为空时客户端不需要填任何 Key**。
+- 429 `Free usage limit reached` 表示当前所有出口/通道的免费额度都在窗口外，等窗口滚动即可恢复（实测同一天内多次"打满→隔一段时间又可用"）；这不是网关故障。
+
+### 备用：嵌入式 opencode2api（驱动本机 opencode serve）
+
+`gateway.config.json` 里保留了一条禁用的 `local-free-embedded` 上游（移植自 TiaraBasori/opencode2api v2，MIT，见 `plugin/` 内的许可副本）：驱动本机 opencode 运行时访问免费模型，账号身份沿用 `opencode auth login` 的登录态。因为它是真实 opencode 客户端，指纹检测天然通过，但单出口 IP 的免费额度没有轮换能力，打满时只能等恢复。需要时把它改回 `enabled: true` 并禁用 Go 上游即可，模型名会变回 `free/opencode/…`。
+
+```json
+{
+  "id": "local-free-embedded",
   "name": "OpenCode Local (embedded opencode2api)",
   "type": "opencode2api",
   "prefix": "free",
@@ -229,17 +257,9 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
   "manageBackend": true,
   "disableTools": true,
   "autoCleanupConversations": true,
-  "enabled": true
+  "enabled": false
 }
 ```
-
-- 首次请求后端会自动拉起（实例初始化约 10~20 秒，之后恢复毫秒级）；网关退出时自动关闭后端。
-- 客户端接入：地址 `http://127.0.0.1:8787/v1`，模型名如 `free/opencode/space-bunny-free`。**网关 `token` 为空时客户端不需要填任何 Key**（任意占位符或不填均可）；`token` 非空时才需要填那个 token。
-- 三种协议端点 + 流式均已实测打通；仅免费档模型可用，付费模型会由上游报 `Insufficient account funds`。
-- **账号身份**：默认沿用 `opencode auth login` 的登录态（`preferAuthFile`），所以网关与 CLI 的可用模型、额度完全一致。不要把别的账号 Key 填进 `zenApiKey`，除非确实想切换身份。
-- 代理：后端与云端上游都靠 `HTTPS_PROXY` 等环境变量出网。Node 的 `fetch` 默认不读这些变量，三个启动入口（两个 start 脚本 + 托盘）已固定设 `NODE_USE_ENV_PROXY=1`，环境里有代理变量即自动生效。DNS 被污染时直连会报 `self signed certificate` / `Unable to connect`，此时必须走代理。
-
-也可改为传统部署：单独运行 opencode2api 服务，然后用 `type: "openai"` + `baseURL` 指向它，效果等同。
 
 ## 环境变量
 

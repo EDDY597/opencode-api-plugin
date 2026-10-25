@@ -2,6 +2,9 @@
 # taskkill /F /T kills the whole tree, so the node runtime and the embedded
 # "opencode serve" backend (its child process) both go down. The tray watches the
 # gateway over /health, so it closes itself shortly after the kill.
+# The free lane's Go opencode2api service (bin\opencode2api.exe, port from
+# bin\config.json "listen", default 18080) runs outside the gateway's process tree,
+# so it is stopped separately below.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File stop-gateway.ps1 [port]
@@ -71,4 +74,26 @@ if (@(Get-ListenPids $Port | Where-Object { $_ -and $_ -ne $PID }).Count -gt 0) 
 }
 if ($failed.Count -gt 0) { exit 1 }
 Write-Output ('Gateway stopped (port {0}).' -f $Port)
+
+# Free lane: stop the Go opencode2api service on its own port (bin\config.json "listen").
+$freePort = 18080
+$freeCfg = Join-Path $Root 'bin\config.json'
+if (Test-Path -LiteralPath $freeCfg) {
+  try {
+    $fcfg = Get-Content -LiteralPath $freeCfg -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($fcfg.listen) { $freePort = [int]$fcfg.listen.Split(':')[-1] }
+  } catch { }
+}
+$freePids = @(Get-ListenPids $freePort | Where-Object { $_ -and $_ -ne $PID })
+if ($freePids.Count) {
+  foreach ($p in $freePids) {
+    $null = taskkill /F /T /PID $p
+    if ($LASTEXITCODE -eq 0) {
+      Write-Output ('Killed opencode2api (pid {0}) on port {1}.' -f $p, $freePort)
+    } else {
+      Write-Warning ('taskkill failed for opencode2api pid {0} - access denied? Try an elevated shell.' -f $p)
+    }
+  }
+  Start-Sleep -Milliseconds 500
+}
 exit 0

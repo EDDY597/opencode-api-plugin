@@ -40,6 +40,9 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 300000
 const DEFAULT_POLL_INTERVAL_MS = 500
 const RETRY_BACKOFF_BASE_MS = 800
 const RETRY_MAX_ATTEMPTS = 3
+// A backend "retry" status scheduled further out than this is not a hiccup worth
+// waiting for: OpenCode parks quota-limited sessions until the next reset.
+const RETRY_WAIT_TOLERANCE_MS = 60_000
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || 30000
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || 8000
 
@@ -124,6 +127,11 @@ function isTransientUpstreamError(error: any) {
   const message = [error.message, error.data?.message].filter((part) => typeof part === "string").join(" ")
   if (!message) return false
 
+  // An exhausted free quota or an unpaid account never heals within a retry ladder,
+  // and polling a failed session just burns the request timeout before the client
+  // finally sees a meaningless "timeout". Classify these as permanent first.
+  if (isPermanentUpstreamError(error)) return false
+
   const transientSignatures = [
     /insufficient balance/i,
     /credits?error/i,
@@ -148,13 +156,62 @@ function isTransientUpstreamError(error: any) {
   return false
 }
 
+/**
+ * Account / entitlement rejections that are permanent for this request. Retrying or
+ * polling cannot fix them, so the proxy must surface the upstream wording at once
+ * instead of waiting out `requestTimeoutMs`.
+ */
+function isPermanentUpstreamError(error: any) {
+  if (!error) return false
+  const message = [error.message, error.data?.message, error.data?.error, error.name]
+    .filter((part) => typeof part === "string")
+    .join(" ")
+  if (!message) return false
+  if (/free[ _-]?(usage|tier)|insufficient (account )?(funds|balance|credits)|quota exceeded|billing|not available in your country|subscription is required|free limit reached/i.test(message)) {
+    return true
+  }
+  const statusMatch = message.match(/\b(\d{3}):/)
+  const status = statusMatch ? Number(statusMatch[1]) : error.statusCode || error.data?.status || null
+  return status === 401 || status === 402 || status === 403
+}
+
+/** Human-readable upstream reason, preferring the provider's own wording. */
+function upstreamErrorText(error: any) {
+  if (!error) return "Unknown upstream error"
+  const message = [error.data?.message, error.data?.error, error.message]
+    .find((part) => typeof part === "string" && part.trim())
+  return (message ?? error.name ?? "Unknown upstream error").toString().trim()
+}
+
+/**
+ * A permanent account/quota rejection, raised so the request ends immediately with
+ * the provider's wording instead of polling a session that will never answer.
+ */
+class PermanentUpstreamError extends Error {
+  /** Original AI_APICallError (or equivalent) for diagnostics. */
+  readonly cause: any
+  constructor(message: string, cause: any) {
+    super(message)
+    this.name = "PermanentUpstreamError"
+    this.cause = cause
+  }
+}
+
 function transformUpstreamError(error: any) {
   let statusCode = 500
   let message = error.message || "Internal server error"
   let type = "internal_error"
   let code = error.code || error.constructor?.name
 
-  if (error.message && error.message.includes("Request timeout")) {
+  if (error instanceof PermanentUpstreamError) {
+    // The provider already told us exactly why (out of funds, free quota reached,
+    // not entitled). Report that verbatim so the caller can act instead of guessing
+    // at a timeout.
+    statusCode = 402
+    type = "insufficient_quota"
+    code = "UPSTREAM_ACCOUNT_ERROR"
+    message = error.message
+  } else if (error.message && error.message.includes("Request timeout")) {
     statusCode = 504
     type = "timeout"
     code = "timeout"
@@ -254,7 +311,10 @@ function transformUpstreamError(error: any) {
 }
 
 function errorResponse(transformed: { statusCode: number; error: any }) {
-  return new Response(JSON.stringify(transformed.error), {
+  // OpenAI-compatible clients (and the gateway in front of this proxy) expect the
+  // `{"error": {...}}` envelope. Wrap the flattened fields so a caller can read
+  // `error.code` instead of pattern-matching a bare `{message, type, code}`.
+  return new Response(JSON.stringify({ error: transformed.error }), {
     status: transformed.statusCode,
     headers: { ...JSON_HEADERS, ...CORS },
   })
@@ -978,6 +1038,42 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
       ;(async () => {
         try {
           for await (const event of await eventStreamPromise) {
+            // A quota wall is not an error message: OpenCode parks the session in a
+            // "retry" state scheduled for a future timestamp (often the next daily
+            // reset, ~11h away) and emits no completion and no error. Waiting for it
+            // is indistinguishable from a hang, so surface it as an upstream error.
+            if (event.type === "session.status" && event.properties?.sessionID === sessionId) {
+              const status = event.properties.status
+              if (status?.type === "retry" && !finished) {
+                const waitMs = typeof status.next === "number" ? status.next - Date.now() : null
+                const reason = String(status.action?.reason ?? status.action?.type ?? "")
+                const quotaWall = /free[ _-]?(tier|usage)|quota|billing|limit|subscribe/i.test(
+                  `${reason} ${status.message ?? ""}`,
+                )
+                if (quotaWall || (waitMs !== null && waitMs > RETRY_WAIT_TOLERANCE_MS)) {
+                  finished = true
+                  clearTimeout(timeoutId)
+                  if (firstDeltaTimer) clearTimeout(firstDeltaTimer)
+                  if (idleTimer) clearTimeout(idleTimer)
+                  logDebug("SSE retry status treated as a quota wall", {
+                    sessionId,
+                    reason,
+                    waitMs,
+                    message: status.message,
+                  })
+                  resolve({
+                    content,
+                    reasoning,
+                    error: {
+                      name: "AI_APICallError",
+                      data: { message: status.message || reason || "Upstream quota exhausted" },
+                    },
+                  })
+                  break
+                }
+              }
+              continue
+            }
             if (event.type === "message.part.updated" && event.properties?.part?.sessionID === sessionId) {
               const { part, delta } = event.properties
               rememberPartType(part)
@@ -1499,16 +1595,26 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
                   logDebug("Stream error:", e.message)
                 }
 
-                const attemptError = collected?.error || collected?.__error || null
-                const nothingStreamed = !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0
-                if (attemptError && nothingStreamed && attempt < RETRY_MAX_ATTEMPTS && isTransientUpstreamError(attemptError)) {
-                  console.warn(
-                    `[Local] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`,
-                    attemptError.data?.message || attemptError.message || attemptError.name || "unknown",
-                  )
-                  continue
-                }
-                break
+              const attemptError = collected?.error || collected?.__error || null
+              const nothingStreamed = !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0
+
+              // A permanent account/quota rejection must not fall through to polling:
+              // the session never produces an assistant message, so polling would wait
+              // out the whole request timeout and hand the client a bare "timeout".
+              if (attemptError && nothingStreamed && isPermanentUpstreamError(attemptError)) {
+                const reason = upstreamErrorText(attemptError)
+                console.warn(`[Local] Permanent upstream error, failing fast: ${reason}`)
+                throw new PermanentUpstreamError(reason, attemptError)
+              }
+
+              if (attemptError && nothingStreamed && attempt < RETRY_MAX_ATTEMPTS && isTransientUpstreamError(attemptError)) {
+                console.warn(
+                  `[Local] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`,
+                  attemptError.data?.message || attemptError.message || attemptError.name || "unknown",
+                )
+                continue
+              }
+              break
               }
 
               const pollFallback = async () => {
@@ -1629,11 +1735,48 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
               requestForcedChatToolCall = makeForcedChatToolCallRequester()
               await sleep(RETRY_BACKOFF_BASE_MS * attempt)
             }
-            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
-            const collected = await pollForAssistantResponse(sessionId!, REQUEST_TIMEOUT_MS)
-            content = collected.content || ""
-            reasoning = collected.reasoning || ""
-            assistantError = collected.error || null
+            // Watch the event stream while the prompt runs. A failed generation
+            // reports its reason only on the `message.updated` event: the persisted
+            // assistant message carries neither `finish` nor `error`, so polling the
+            // snapshot can never observe it and would just wait out the full timeout
+            // while the client sees a meaningless "Request timeout".
+            let collected: any = null
+            try {
+              const collectPromise = collectFromEvents(
+                sessionId!,
+                REQUEST_TIMEOUT_MS,
+                null,
+                EVENT_FIRST_DELTA_TIMEOUT_MS,
+                EVENT_IDLE_TIMEOUT_MS,
+              )
+              client
+                .sessionPrompt(promptParams.path.id, promptParams.body)
+                .catch((err: any) => logDebug("Prompt error:", err?.message))
+              collected = await collectPromise.catch((err) => ({ __error: err }))
+            } catch (e: any) {
+              logDebug("Non-stream collect error:", e.message)
+            }
+
+            let attemptError = collected?.error || collected?.__error || null
+            content = collected?.content || ""
+            reasoning = collected?.reasoning || ""
+            assistantError = attemptError
+
+            // No usable event data (stream dropped, or the backend stayed silent):
+            // fall back to polling the session snapshot, which is correct whenever
+            // the generation is merely slow rather than rejected.
+            if ((collected?.__error || collected?.noData || collected?.idleTimeout) && !content && !reasoning) {
+              logDebug("Non-stream falling back to polling", { sessionId })
+              const polled = await pollForAssistantResponse(sessionId!, REQUEST_TIMEOUT_MS)
+              content = polled.content || ""
+              reasoning = polled.reasoning || ""
+              attemptError = polled.error || null
+              assistantError = attemptError
+            }
+
+            // Permanent account/quota rejections never heal: stop retrying and report
+            // them below with the provider's own wording.
+            if (assistantError && !content && !reasoning && isPermanentUpstreamError(assistantError)) break
             if (assistantError && !content && !reasoning && attempt < RETRY_MAX_ATTEMPTS && isTransientUpstreamError(assistantError)) {
               console.warn(
                 `[Local] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`,
@@ -1644,6 +1787,11 @@ export function createLocalProxy(config: LocalProxyConfig): LocalProxy {
             break
           }
           if (assistantError && !content && !reasoning) {
+            if (isPermanentUpstreamError(assistantError)) {
+              const reason = upstreamErrorText(assistantError)
+              console.warn(`[Local] Permanent upstream error, failing fast: ${reason}`)
+              return errorResponse(transformUpstreamError(new PermanentUpstreamError(reason, assistantError)))
+            }
             return jsonResponse(
               {
                 error: {
@@ -2409,7 +2557,14 @@ function sseResponse(run: (emit: (frame: string) => void) => Promise<void>): Res
       run(emit)
         .catch((error) => {
           try {
-            emit(`data: ${JSON.stringify({ error: { message: error?.message ?? "stream error" } })}\n\n`)
+            // Headers are already flushed, so an account rejection can only travel as
+            // an error frame. Keep the provider's wording and tag it, instead of
+            // closing the stream as if the turn had simply produced nothing.
+            const payload =
+              error instanceof PermanentUpstreamError
+                ? { error: { message: error.message, type: "insufficient_quota", code: "UPSTREAM_ACCOUNT_ERROR" } }
+                : { error: { message: error?.message ?? "stream error" } }
+            emit(`data: ${JSON.stringify(payload)}\n\n`)
           } catch {}
         })
         .finally(() => {

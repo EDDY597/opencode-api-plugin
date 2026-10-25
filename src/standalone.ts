@@ -21,7 +21,12 @@ const hostname = process.env.OPENCODE_GO_GATEWAY_HOST ?? "127.0.0.1"
 const parsedPort = Number(process.env.OPENCODE_GO_GATEWAY_PORT ?? 8787)
 const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8787
 
+// Disabled upstreams must not spawn backends: a disabled embedded lane would
+// otherwise start `opencode serve` at boot and idle there forever (and its
+// requests would still burn the machine's free-tier quota if anything local
+// pointed at it). Shutdown keeps the unfiltered list: kill what exists.
 const localUpstreams = upstreams.filter((upstream) => upstream.local)
+const warmableLocalUpstreams = localUpstreams.filter((upstream) => upstream.enabled)
 
 function shutdown(signal: string) {
   console.log(`\n[Gateway] Received ${signal}, shutting down...`)
@@ -92,7 +97,7 @@ server.listen(port, hostname, () => {
       + ' Start through start-gateway.cmd or the tray (both set it) instead of a bare `node src/standalone.ts`.',
     )
   }
-  for (const upstream of localUpstreams) {
+  for (const upstream of warmableLocalUpstreams) {
     upstream.local
       ?.warmup()
       .then(() => console.log(`[Gateway] Local OpenCode backend ready for upstream '${upstream.id}'`))
