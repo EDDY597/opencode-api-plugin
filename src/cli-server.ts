@@ -1,4 +1,5 @@
 import { createServer } from "node:http"
+import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import {
   normalizeCliModel,
@@ -10,13 +11,23 @@ import {
 import { servePrompt, stopServe, serveBaseUrl, quotaBlocked, tripQuotaBreaker, type ServeResult } from "./opencode-local/serve-backend.ts"
 
 /**
- * OpenAI-compatible front end for the `opencode run` CLI backend.
+ * OpenAI-compatible front end for OpenCode's free models.
  *
- * This is the only way to serve OpenCode's free models over HTTP: the entitlement is
- * attached to the CLI binary, not to an API key (see cli-backend.ts for the evidence).
- * Runs standalone so the gateway can point a normal `type: "openai"` upstream at it.
+ * Two transports, selected with `--transport`:
  *
- *   node src/cli-server.ts [--port 18081] [--model opencode/big-pickle]
+ *   http (default) — plain HTTPS to zen/v1 with the anonymous free-tier credential.
+ *                    Answers in ~1s, real errors (429/403/400) with Retry-After.
+ *   cli            — drives the `opencode` CLI (resident `opencode serve`, or one-shot
+ *                    runs). Slower and it cannot stream or call tools, but it is the
+ *                    official client, so it is the fallback if upstream gates the
+ *                    HTTP path for non-official callers.
+ *
+ * The HTTP transport is a straight forwarder: it sends `Authorization`, a versioned
+ * User-Agent, and `stream: true`, and nothing else. It does not fabricate tool
+ * declarations or mint session ids to satisfy upstream gates — if those gates are
+ * enforced, this transport is supposed to fail loudly rather than route around them.
+ *
+ *   node src/cli-server.ts [--port 18080] [--transport http|cli]
  */
 
 type Options = CliBackendOptions & {
@@ -24,6 +35,14 @@ type Options = CliBackendOptions & {
   hostname: string
   /** Keys a client may present. Empty means no auth (loopback only). */
   apiKeys: string[]
+  /** `http` forwards to zen/v1; `cli` drives the opencode binary. */
+  transport: "http" | "cli"
+  /** zen/v1 base for the http transport. */
+  httpBaseUrl: string
+  /** Free-tier credential. `public` is the anonymous one; no personal key needed. */
+  httpKey: string
+  /** Sent verbatim; upstream wants an `opencode/<version>` shape. */
+  httpUserAgent: string
   /** Keep a warm `opencode serve` backend instead of spawning one CLI per request. */
   useServe: boolean
   /** Port for that backend. */
@@ -69,6 +88,10 @@ function parseArgs(argv: string[]): Options {
     dataHome: process.env.OPENCODE_CLI_DATA_HOME,
     cwd: process.env.OPENCODE_CLI_CWD,
     apiKeys: [],
+    transport: (process.env.OPENCODE_CLI_TRANSPORT as "http" | "cli") ?? "http",
+    httpBaseUrl: process.env.OPENCODE_CLI_HTTP_BASE ?? "https://opencode.ai/zen/v1",
+    httpKey: process.env.OPENCODE_CLI_HTTP_KEY ?? "public",
+    httpUserAgent: process.env.OPENCODE_CLI_HTTP_UA ?? "opencode/1.19.0",
     useServe: true,
     servePort: Number(process.env.OPENCODE_CLI_SERVE_PORT ?? 10001),
     allowFallback: true,
@@ -91,6 +114,10 @@ function parseArgs(argv: string[]): Options {
     else if (arg === "--no-serve") opts.useServe = false
     else if (arg === "--no-fallback") opts.allowFallback = false
     else if (arg === "--models") opts.models = next().split(",")
+    else if (arg === "--transport") opts.transport = next() === "cli" ? "cli" : "http"
+    else if (arg === "--http-base") opts.httpBaseUrl = next()
+    else if (arg === "--http-key") opts.httpKey = next()
+    else if (arg === "--http-ua") opts.httpUserAgent = next()
   }
   if (opts.apiKeys.length === 0 && process.env.OPENCODE_CLI_KEYS) {
     opts.apiKeys = process.env.OPENCODE_CLI_KEYS.split(",").map((k) => k.trim()).filter(Boolean)
@@ -158,17 +185,188 @@ function servedModels(primary: string | undefined): string[] {
   return [...new Set(ids.length ? ids : ["big-pickle"])]
 }
 
+/** Flatten a chat message's content to plain text (the upstream takes strings here). */
+function messageText(content: any): string {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((part: any) => (typeof part === "string" ? part : part?.type === "text" ? (part.text ?? "") : ""))
+      .filter(Boolean)
+      .join("\n")
+  }
+  return ""
+}
+
+/** An upstream refusal that kept its HTTP status and Retry-After. */
+class UpstreamRefusal extends Error {
+  upstreamStatus: number
+  retryAfterSeconds?: number
+  constructor(message: string, status: number, retryAfterSeconds?: number) {
+    super(message)
+    this.upstreamStatus = status
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+}
+
+/** Drop the `provider/` segment: the CLI wants it, zen/v1 does not. */
+function bareModelId(model: string): string {
+  const slash = model.indexOf("/")
+  return slash >= 0 ? model.slice(slash + 1) : model
+}
+
+/**
+ * Forward one request to zen/v1 and reassemble the SSE stream.
+ *
+ * Streaming upstream, buffered locally: that is not a downgrade, it is what the two
+ * call sites in this file already do (they synthesize their own SSE frames from the
+ * finished text). Asking upstream for `stream: true` keeps us on the path the free
+ * tier serves; the caller still gets its answer in one piece.
+ */
+async function callHttp(messages: CliMessage[], runOptions: Options): Promise<ServeResult> {
+  const base = runOptions.httpBaseUrl.replace(/\/+$/, "")
+  // `normalizeCliModel` prefixes a bare id with `opencode/` because the CLI needs a
+  // provider segment. zen/v1 does not: sending `opencode/glm-5.3-flash-free` there is a
+  // 400 "Model is unavailable", which looks like a quota or gate failure but is just a
+  // wrong model id.
+  const model = bareModelId(normalizeCliModel(runOptions.model))
+  const sessionID = `http-${randomUUID().replace(/-/g, "").slice(0, 24)}`
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), runOptions.timeoutMs)
+
+  try {
+    let response: Response
+    try {
+      response = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "text/event-stream",
+          authorization: `Bearer ${runOptions.httpKey}`,
+          "user-agent": runOptions.httpUserAgent,
+        },
+        body: JSON.stringify({
+          model,
+          stream: true,
+          messages: messages.map((message) => ({ role: message.role, content: messageText(message.content) })),
+        }),
+        signal: controller.signal,
+      })
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        throw new Error(`upstream did not answer within ${runOptions.timeoutMs}ms (timed out)`)
+      }
+      throw error
+    }
+
+    if (!response.ok) {
+      const raw = await response.text().catch(() => "")
+      const retryAfterHeader = response.headers.get("retry-after")
+      const retryAfter = retryAfterHeader && Number.isFinite(Number(retryAfterHeader))
+        ? Number(retryAfterHeader)
+        : undefined
+      const detail = upstreamDetail(raw)
+      throw new UpstreamRefusal(
+        `${response.status} ${detail || response.statusText}`,
+        response.status,
+        retryAfter,
+      )
+    }
+
+    // A compliant upstream streams; if it ignored `stream`, the body is one JSON object.
+    const contentType = response.headers.get("content-type") ?? ""
+    if (contentType.includes("application/json")) {
+      const json: any = await response.json()
+      const message = json?.choices?.[0]?.message ?? {}
+      return {
+        text: typeof message.content === "string" ? message.content : messageText(message.content),
+        usage: usageFromChat(json?.usage),
+        cost: 0,
+        sessionID,
+        finishReason: json?.choices?.[0]?.finish_reason ?? "stop",
+      }
+    }
+
+    let text = ""
+    let finishReason = "stop"
+    let usage = usageFromChat(undefined)
+    let buffer = ""
+    const reader = response.body?.getReader()
+    const decoder = new TextDecoder()
+    while (reader) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const frames = buffer.split("\n\n")
+      buffer = frames.pop() ?? ""
+      for (const frame of frames) {
+        for (const line of frame.split("\n")) {
+          if (!line.startsWith("data:")) continue
+          const payload = line.slice(5).trim()
+          if (!payload || payload === "[DONE]") continue
+          let event: any
+          try {
+            event = JSON.parse(payload)
+          } catch {
+            continue
+          }
+          const choice = event?.choices?.[0]
+          const delta = choice?.delta ?? choice?.message
+          if (typeof delta?.content === "string") text += delta.content
+          if (choice?.finish_reason) finishReason = choice.finish_reason
+          if (event?.usage) usage = usageFromChat(event.usage)
+        }
+      }
+    }
+
+    return { text, usage, cost: 0, sessionID, finishReason }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Map an OpenAI-shaped `usage` block onto this file's ServeResult shape. */
+function usageFromChat(usage: any) {
+  const input = Number(usage?.prompt_tokens ?? 0)
+  const output = Number(usage?.completion_tokens ?? 0)
+  return {
+    input,
+    output,
+    reasoning: Number(usage?.completion_tokens_details?.reasoning_tokens ?? 0),
+    cacheRead: Number(usage?.prompt_tokens_details?.cached_tokens ?? 0),
+    total: Number(usage?.total_tokens ?? input + output),
+  }
+}
+
+/** Pull a human-readable reason out of an error body. */
+function upstreamDetail(raw: string): string {
+  try {
+    const json = JSON.parse(raw)
+    const message = json?.error?.message ?? json?.message
+    if (typeof message === "string" && message.trim()) return message.trim()
+  } catch {
+    void 0
+  }
+  return raw.trim().slice(0, 300)
+}
+
+
 /**
  * Send one request to a model.
  *
- * Prefers the persistent `opencode serve` backend: a one-shot `opencode run` costs ~30s per
- * call here, while a warm server answers in 4-5s. The one-shot path stays as a fallback for
- * when the server cannot start, so the lane degrades in latency rather than failing.
+ * The transport decides everything: `http` is a direct zen/v1 call (fast, real status
+ * codes), `cli` drives the opencode binary. With `cli`, prefer the persistent
+ * `opencode serve` backend — a one-shot `opencode run` costs ~30s per call here, while a
+ * warm server answers in 4-5s — and keep the one-shot path as a fallback so the lane
+ * degrades in latency rather than failing.
  *
  * This is the only function that reaches a model, so it is the only place quota is spent:
  * nothing here runs on a timer.
  */
 async function callModel(messages: CliMessage[], runOptions: Options): Promise<ServeResult | import("./opencode-local/cli-backend.ts").CliRunResult> {
+  // The HTTP transport fails fast and reports the real status, so the CLI-era breaker
+  // (built to stop a hung binary from holding requests for 20s) does not apply to it.
+  if (opts.transport === "http") return callHttp(messages, runOptions)
+
   // Check the quota breaker before choosing a transport. Putting this only inside the
   // serve path was not enough: when the warm backend is down, the one-shot fallback ran
   // anyway and spent another 30s+ on a window that was already closed.
@@ -345,6 +543,13 @@ async function handleResponses(body: any, res: any) {
     else if (/model not found|unknown model|no such model|unsupported model/i.test(message)) status = 400
     else if (/unauthorized|invalid api key|authentication/i.test(message)) status = 401
     else if (/timed out/i.test(message)) status = 504
+    // The HTTP transport already knows the real status; do not re-derive it from text.
+    if (Number.isFinite(Number(error?.upstreamStatus)) && Number(error.upstreamStatus) >= 400) {
+      status = Number(error.upstreamStatus)
+    }
+    if (status === 429 && Number.isFinite(Number(error?.retryAfterSeconds))) {
+      res.setHeader("retry-after", String(Math.max(1, Math.round(Number(error.retryAfterSeconds)))))
+    }
     json(res, status, { error: { message, type: "upstream_error", code: null } })
   }
 }
@@ -404,11 +609,20 @@ async function handleCompletion(body: any, res: any) {
     else if (/model not found|unknown model|no such model|unsupported model/i.test(message)) status = 400
     else if (/unauthorized|invalid api key|authentication/i.test(message)) status = 401
     else if (/timed out|did not answer/i.test(message)) status = 504
+    // The HTTP transport already knows the real status; do not re-derive it from text.
+    if (Number.isFinite(Number(error?.upstreamStatus)) && Number(error.upstreamStatus) >= 400) {
+      status = Number(error.upstreamStatus)
+    }
     // Retry-After lets a client back off properly instead of hammering a closed window.
+    // Upstream's value wins; the CLI path only has its own wording to go on.
     if (status === 429) {
       const minutes = /Retry in about (\d+) minute/i.exec(message)?.[1]
-      const seconds = minutes ? Number(minutes) * 60 : 900
-      res.setHeader("retry-after", String(seconds))
+      const seconds = Number.isFinite(Number(error?.retryAfterSeconds))
+        ? Number(error.retryAfterSeconds)
+        : minutes
+          ? Number(minutes) * 60
+          : 900
+      res.setHeader("retry-after", String(Math.max(1, Math.round(seconds))))
     }
     json(res, status, { error: { message, type: "upstream_error", code: null } })
   }
@@ -520,16 +734,19 @@ const server = createServer(async (req, res) => {
 })
 
 server.listen(opts.port, opts.hostname, () => {
+  const target = opts.transport === "http" ? `${opts.httpBaseUrl} (Bearer ${opts.httpKey === "public" ? "public" : "***"})` : `cli=${opts.opencodePath}`
   console.log(
     `[cli-server] listening on http://${opts.hostname}:${opts.port}/v1 ` +
-      `model=${normalizeCliModel(opts.model)} cli=${opts.opencodePath} ` +
-      `mode=${opts.useServe ? `serve:${opts.servePort}` : "oneshot"} auto=${opts.autoApprove}`,
+      `model=${normalizeCliModel(opts.model)} transport=${opts.transport} ${target} ` +
+      (opts.transport === "cli" ? `mode=${opts.useServe ? `serve:${opts.servePort}` : "oneshot"} ` : "") +
+      `auto=${opts.autoApprove}`,
   )
 })
 
 // Warm the backend at startup so the first real request is already ~4s rather than ~30s.
 // This starts a server process; it does not call a model, so it costs no free quota.
-if (opts.useServe) {
+// Only the CLI transport has a backend to warm.
+if (opts.useServe && opts.transport === "cli") {
   void (async () => {
     try {
       const { ensureServe } = await import("./opencode-local/serve-backend.ts")

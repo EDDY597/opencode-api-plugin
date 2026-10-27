@@ -1,10 +1,19 @@
 import { createServer } from "node:http"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { createHandler, loadFileConfig } from "./gateway.ts"
+import { createHandler, isLoopbackHost, loadFileConfig } from "./gateway.ts"
 import { startFreeLane, stopFreeLane } from "./free-lane.ts"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
+
+/** True when an upstream base URL points at this machine (the CLI lane on 18080). */
+function isLocalUrl(baseURL: string): boolean {
+  try {
+    return isLoopbackHost(new URL(baseURL).hostname)
+  } catch {
+    return false
+  }
+}
 
 const fileConfig = loadFileConfig() ?? {}
 
@@ -114,8 +123,16 @@ server.listen(port, hostname, () => {
 
   // The free lane is owned by the gateway so its lifetime matches: the DSH plugin only
   // registers free models if 18080 answers when the plugin loads, and a separate autostart
-  // entry kept losing that race. Skip it when the gateway has no enabled `free` upstream.
-  const freeUpstream = upstreams.find((upstream) => upstream.prefix === "free" && upstream.enabled)
+  // entry kept losing that race.
+  //
+  // Only start it when the `free` upstream actually points at that local CLI server. When
+  // the free lane is plain HTTPS (the default: `free-http` → https://opencode.ai/zen/v1)
+  // there is no local server to own, and spawning cli-server would add two idle processes
+  // plus a 18080 listener for nothing — and its port would still be derived from a remote
+  // URL's (empty) port, i.e. 18080 by accident.
+  const freeUpstream = upstreams.find(
+    (upstream) => upstream.prefix === "free" && upstream.enabled && isLocalUrl(upstream.baseURL),
+  )
   if (freeUpstream) {
     const port = Number(new URL(freeUpstream.baseURL).port || 18080)
     void startFreeLane(ROOT, port, {

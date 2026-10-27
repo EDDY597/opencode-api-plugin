@@ -1204,6 +1204,34 @@ function sessionIdFor(request: Request, body: any) {
   return createHash("sha1").update(seed).digest("hex").slice(0, 32)
 }
 
+/**
+ * Session id for the OpenCode Go preset.
+ *
+ * `/zen/go/v1` answers `400 MissingSessionID` when `x-opencode-session` is absent,
+ * and — measured 2026-10-27 — it accepts any value: a 32-char sha1 and a
+ * canonical `ses_0000000ffe…` id both returned 200. So no id minting is needed
+ * beyond a stable, unique-enough string. Session ids also drive upstream routing
+ * affinity and prompt caching, so a session the caller names wins.
+ *
+ * When the caller names nothing, the old sha1-of-first-message fallback is kept:
+ * it is what shipped until now, and changing it would churn cache affinity on
+ * every request with no measured gain.
+ */
+function openCodeGoSessionId(request: Request, body: any) {
+  const named =
+    request.headers.get("x-opencode-session") ||
+    request.headers.get("x-session-id") ||
+    body?.metadata?.session_id ||
+    body?.parent_session_id
+  if (named) return String(named)
+  return sessionIdFor(request, body)
+}
+
+/** Route the session id through the preset-aware picker where one exists. */
+function sessionForUpstream(upstream: Upstream, request: Request, body: any) {
+  return upstream.presetOpenCodeGo ? openCodeGoSessionId(request, body) : sessionIdFor(request, body)
+}
+
 function jsonResponse(data: any, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { ...JSON_HEADERS, ...CORS } })
 }
@@ -1411,7 +1439,16 @@ function upstreamHeaders(upstream: Upstream, session: string, protocol?: Protoco
   if (apiKey && (mode === "bearer" || mode === "both")) headers.authorization = `Bearer ${apiKey}`
   if (apiKey && (mode === "x-api-key" || mode === "both")) headers["x-api-key"] = apiKey
   if (protocol === "anthropic" && !headers["anthropic-version"]) headers["anthropic-version"] = "2023-06-01"
-  if (upstream.sessionHeader) headers["x-opencode-session"] = session
+  if (upstream.sessionHeader) {
+    // Go is strict about the header name: `x-opencode-session-id` alone still
+    // answers 400 MissingSessionID (measured 2026-10-27), so the un-suffixed
+    // spelling is the one that must always be present.
+    headers["x-opencode-session"] = session
+    // The official client sends both; upstream reads the -id variant on the free
+    // lane, so mirror it there. Harmless on Go, where only the un-suffixed name
+    // is checked.
+    if (!upstream.presetOpenCodeGo) headers["x-opencode-session-id"] = session
+  }
   return headers
 }
 
@@ -1780,7 +1817,9 @@ function upstreamErrorDetail(text: string) {
  */
 export function isFatalUpstreamError(status: number, text: string) {
   if (status === 401 || status === 402 || status === 403) return true
-  return /insufficient (account )?(funds|balance|credits)|free usage limit reached|quota exceeded|billing|not available in your country/i.test(text)
+  // RegionError is a 403 in practice, but keep it explicit: a country block never
+  // heals by retrying, and the default ladder would otherwise spend its attempts.
+  return /insufficient (account )?(funds|balance|credits)|free usage limit reached|quota exceeded|billing|not available in your country|"RegionError"/i.test(text)
 }
 
 /** Honor Retry-After when present, clamped to the configured delay ceiling. */
@@ -2332,7 +2371,7 @@ export function createHandler(options: GatewayOptions = {}) {
         if (!body?.model) return errorResponse("Missing required field: model")
         const resolved = resolveModel(body.model, upstreams)
         if (!resolved) return errorResponse(`No enabled upstream for model ${body.model}`, 404, "model_not_found")
-        const session = sessionIdFor(request, body)
+        const session = sessionForUpstream(resolved.upstream, request, body)
         return await runUpstream(resolved.upstream, resolved.model, body, Boolean(body.stream), session)
       }
 
@@ -2341,7 +2380,7 @@ export function createHandler(options: GatewayOptions = {}) {
         if (!body?.model) return errorResponse("Missing required field: model")
         const resolved = resolveModel(body.model, upstreams)
         if (!resolved) return errorResponse(`No enabled upstream for model ${body.model}`, 404, "model_not_found")
-        const session = sessionIdFor(request, body)
+        const session = sessionForUpstream(resolved.upstream, request, body)
         const pivot = anthropicToChat({ ...body, model: resolved.model })
         const response = await runUpstream(resolved.upstream, resolved.model, pivot, Boolean(body.stream), session)
         if (!response.ok) return response
@@ -2371,7 +2410,7 @@ export function createHandler(options: GatewayOptions = {}) {
             "not_implemented",
           )
         }
-        const session = sessionIdFor(request, body)
+        const session = sessionForUpstream(resolved.upstream, request, body)
         const response = await fetchWithTtfbTimeout(
           `${resolved.upstream.baseURL}/responses`,
           {
