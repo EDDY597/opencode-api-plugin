@@ -75,7 +75,10 @@ if (@(Get-ListenPids $Port | Where-Object { $_ -and $_ -ne $PID }).Count -gt 0) 
 if ($failed.Count -gt 0) { exit 1 }
 Write-Output ('Gateway stopped (port {0}).' -f $Port)
 
-# Free lane: stop the Go opencode2api service on its own port (bin\config.json "listen").
+# Free lane: stop whichever service owns the free port. It may be the Go opencode2api
+# (bin\config.json "listen") or the CLI server (src\cli-server.ts) — both use 18080
+# because that is what the DSH plugin expects. Match on the executable/script name so a
+# stray unrelated listener on that port is never killed.
 $freePort = 18080
 $freeCfg = Join-Path $Root 'bin\config.json'
 if (Test-Path -LiteralPath $freeCfg) {
@@ -84,16 +87,19 @@ if (Test-Path -LiteralPath $freeCfg) {
     if ($fcfg.listen) { $freePort = [int]$fcfg.listen.Split(':')[-1] }
   } catch { }
 }
-$freePids = @(Get-ListenPids $freePort | Where-Object { $_ -and $_ -ne $PID })
-if ($freePids.Count) {
-  foreach ($p in $freePids) {
-    $null = taskkill /F /T /PID $p
-    if ($LASTEXITCODE -eq 0) {
-      Write-Output ('Killed opencode2api (pid {0}) on port {1}.' -f $p, $freePort)
-    } else {
-      Write-Warning ('taskkill failed for opencode2api pid {0} - access denied? Try an elevated shell.' -f $p)
-    }
+foreach ($p in @(Get-ListenPids $freePort | Where-Object { $_ -and $_ -ne $PID })) {
+  $cmdline = ''
+  try { $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId=$p").CommandLine } catch { }
+  $isFreeLane = $cmdline -match 'opencode2api' -or $cmdline -match 'cli-server\.ts' -or $cmdline -match 'cli-server\.m?js'
+  if (-not $isFreeLane) {
+    Write-Output ('Left pid {0} on port {1} alone (not the free lane).' -f $p, $freePort)
+    continue
   }
-  Start-Sleep -Milliseconds 500
+  $null = taskkill /F /T /PID $p
+  if ($LASTEXITCODE -eq 0) {
+    Write-Output ('Killed the free-lane service (pid {0}) on port {1}.' -f $p, $freePort)
+  } else {
+    Write-Warning ('taskkill failed for the free-lane pid {0} - access denied? Try an elevated shell.' -f $p)
+  }
 }
 exit 0

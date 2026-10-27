@@ -212,9 +212,85 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/usage` | 聚合配置了 `usageBase` 的上游额度 |
 
-## 实战：免费模型（Go 版 opencode2api）
+## 实战：免费模型（CLI 通道，实测可用）
 
-免费档当前走 `bin\` 下的 [opencode2api](https://github.com/jasonxu114514/opencode2api)（Go，MIT）独立服务。2026-10 起 OpenCode 收紧了免费档的客户端检测：裸 API 调用直接 403 `FreeTierError`（free tier can only be used from within OpenCode），并按出口 IP 统计免费额度，打满后返回 429 `Free usage limit reached` 且间隔性恢复。该服务以完整客户端保真度访问上游——Bun TLS 指纹（uTLS 复刻 ClientHello）、OpenCode 2.1 版本号与 `/inference` 路由、逐字节对齐请求体——并支持多出口轮换、单出口打满后冷却 15 分钟（`free_tier_block_seconds`）、匿名通道（无需任何账号，`anonymous: true`）。
+> **2026-10-26 实测结论**：OpenCode 的免费额度**挂在官方客户端本身上，不挂在 API Key 上**。这一点决定了所有 HTTP 转发方案（含 Go 版 opencode2api）的成败，先看清楚再选路。
+
+实测证据（同一模型 `big-pickle`、同一台机器、同一时刻）：
+
+| 调用方式 | 结果 |
+| --- | --- |
+| `opencode run`（**干净数据目录，无 auth.json、无任何 Key**） | ✅ 正常返回 |
+| 裸 HTTP `POST https://opencode.ai/zen/v1/messages` + 你的 `oc_sk_` Key | ❌ 429 `FreeUsageLimitError` |
+| 同上，但伪造 `User-Agent: opencode/1.18.34` | ❌ 429（UA 不是判定依据） |
+| opencode2api 匿名通道 `/inference` | ❌ 429，`Retry-After` ≈ 9 小时 |
+
+关键点：**你的 Key 对免费模型没有任何额度**，换 Key、填 `zen_keys`、改 UA、切 `anonymous` 都无效。而 CLI 在完全没有凭据的情况下反而能用——额度判定依据的是「是不是官方客户端进程」，不是「谁在转发」。
+
+### 方案：`src/cli-server.ts`（本仓库新增）
+
+把 `opencode run` 当成后端进程驱动，对外暴露 OpenAI 兼容接口，网关和 DSH 插件都能接入：
+
+```
+DSH 插件 ─────────────────────────────┐
+                                      ├──► cli-server :18080 ──► opencode run ──► 免费模型
+客户端 ──► 网关 :8787 ──► free/ 上游 ──┘
+```
+
+启动（**端口必须是 18080**，原因见下）：
+
+```bash
+start-cli-server.cmd
+```
+
+#### 为什么必须固定 18080，以及为什么必须开机自启
+
+DSH 插件（`dsh-opencode-gateway`）的 `free` 路由**是直连 18080 的，不经过 8787**。它的默认配置是 `free.mode = "service"`、`free.serviceUrl = "http://127.0.0.1:18080"`，且 `manageService = true`——也就是说：
+
+> 插件启动时探 `18080/healthz`，**没人应答就自己去拉起 `bin/opencode2api.exe`**。
+
+于是踩过一个典型故障：手动起了 CLI 服务、插件也正常，但**重启 DSH 后 18080 被 opencode2api 抢回**，免费模型又开始报「额度已用尽」。原因是 CLI 服务没有自启，插件等不到它就走了默认那条已经失效的路。
+
+解决办法是让 CLI 服务**先于 DSH 常驻**：
+
+```bash
+install-cli-autostart.cmd          # 写入 HKCU\...\Run，登录即后台启动
+install-cli-autostart.cmd remove   # 取消
+```
+
+它通过 `start-cli-server-hidden.vbs` 无窗口启动。只要 CLI 服务已在监听，插件检测到健康就会**原样复用、绝不重启**（`ensureServiceRunning` 里 `serviceHealthy` 为真就直接 return）。
+
+#### 鉴权约定
+
+插件从 `bin/config.json` 读 `server_keys[0]`，作为 Bearer token 发给 18080。因此 `cli-server` 用 `--config bin/config.json` 复用同一份 key：
+
+- `start-cli-server.cmd` 已自动带上 `--config "%~dp0bin\config.json"`
+- 无 key 调用返回 `401 {"error":{"message":"invalid local API key","type":"authentication_error"}}`，与 opencode2api 的错误体一致
+- `/healthz`、`/health`、`/v1/health` 不校验 key（供探活）
+
+已验证能力：
+
+- 非流式 / 流式（SSE，含 `[DONE]` 与 usage 帧）
+- `/v1/responses`（非流式 + 流式事件序列）——插件在 Responses 协议下会转发此路由
+- 多轮上下文：网关每次收到完整 `messages`，适配器把历史拍平成一次 prompt 注入（不依赖 CLI 会话状态，客户端裁剪历史也不会错）
+- 工具调用：CLI 跑自己的 agent 循环（`--auto` 自动批准），模型会真的执行命令；调用方的 `tools` 定义被忽略
+- 计费：`cost: 0`，usage 取自 CLI 的 `step_finish` 事件
+
+单次请求实测约 **8–30 秒**（冷启动偏慢），比 HTTP 直连明显慢——这是每次都要拉起一个 CLI 进程的代价。
+
+已知取舍（实现时踩过的坑，见 `src/opencode-local/cli-backend.ts` 注释）：
+
+1. **不要设置 `XDG_DATA_HOME`**。为绕开中文用户名路径问题重定向 XDG 会让 CLI 永久挂起（实测 70s 内零事件，正常只要 ~10s）。
+2. 必须 spawn 真正的 `opencode.exe`，不要 spawn `.cmd` 垫片 + `shell: true`，否则 stdout 被 cmd.exe 干扰导致 NDJSON 流卡死（实测挂 180s）。
+3. `stdio[0]` 要设为 `ignore`，否则 CLI 可能等待 stdin。
+4. CLI 把上游故障伪装成正常回复文本（如 `Unexpected server error. Check server logs for details.`，退出码 0）。适配器已把它归类为失败并返回非 200，避免假成功。
+
+### 旧方案一：Go 版 opencode2api（失败）
+
+免费档原本走 `bin\` 下的 [opencode2api](https://github.com/jasonxu114514/opencode2api)（Go，MIT）独立服务。2026-10 起 OpenCode 收紧了免费档的客户端检测：裸 API 调用直接 403 `FreeTierError`（free tier can only be used from within OpenCode），并按出口 IP 统计免费额度，打满后返回 429 `Free usage limit reached` 且间隔性恢复。该服务以完整客户端保真度访问上游——Bun TLS 指纹（uTLS 复刻 ClientHello）、OpenCode 2.1 版本号与 `/inference` 路由、逐字节对齐请求体——并支持多出口轮换、单出口打满后冷却 15 分钟（`free_tier_block_seconds`）、匿名通道（无需任何账号，`anonymous: true`）。
+
+**但实测（2026-10-26）这条路当前已不可用**：`/inference` 匿名池返回 429 且 `Retry-After` 约 9 小时，轮换出口无法绕过账号级额度。保留本节的配置说明仅为历史参考；要恢复免费模型请用上面的 CLI 通道。
+
 
 `bin\config.json`（服务自身配置，已被 .gitignore 忽略）：
 

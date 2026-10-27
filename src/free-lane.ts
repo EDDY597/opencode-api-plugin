@@ -1,0 +1,180 @@
+import { spawn } from "node:child_process"
+import fs from "node:fs"
+import path from "node:path"
+
+/**
+ * Owns the CLI free-lane server as a child of the gateway process.
+ *
+ * Why the gateway owns it: the DSH plugin registers its free-tier provider only if the
+ * service at 18080 answers /healthz *when the plugin loads*. That makes startup ordering
+ * load-bearing, and a separate autostart entry keeps losing that race (a Run key fires at
+ * logon, long before the harness restarts mid-session). Binding the lane to the gateway
+ * removes the race: whoever starts the gateway gets the lane, and both live or die together.
+ *
+ * The child is detached into its own process group on Windows so a console Ctrl-C aimed at
+ * the gateway does not tear the server down mid-request; `stop()` is the only intended exit.
+ *
+ * This module starts a server process. It never calls a model, so it costs no free quota.
+ */
+
+const HEALTH_TIMEOUT_MS = 2_000
+const READY_TIMEOUT_MS = 90_000
+const READY_POLL_MS = 1_000
+
+export type FreeLaneStatus = "starting" | "ready" | "failed" | "disabled"
+
+type LaneState = {
+  status: FreeLaneStatus
+  port: number
+  child?: any
+  error?: string
+}
+
+let state: LaneState = { status: "disabled", port: 0 }
+
+/** Is something already serving the lane on this port? */
+async function laneHealthy(port: number): Promise<boolean> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    })
+    if (!response.ok) return false
+    const body: any = await response.json().catch(() => undefined)
+    return body?.backend === "opencode-cli"
+  } catch {
+    return false
+  }
+}
+
+export function freeLaneStatus(): LaneState {
+  return { ...state }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Find the opencode CLI.
+ *
+ * `opencode` on PATH resolves to a PowerShell script here, which Node cannot spawn — it
+ * fails with `spawn opencode ENOENT` and every free-model request 502s. Resolve to the real
+ * .exe instead.
+ */
+function resolveOpencodePath(): string {
+  const explicit = process.env.OPENCODE_CLI_PATH
+  if (explicit && fs.existsSync(explicit)) return explicit
+
+  const candidates = [
+    "E:\\STUDY\\IT\\nodejs\\node_global\\node_modules\\opencode-ai\\bin\\opencode.exe",
+    path.join(process.env.APPDATA ?? "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"),
+    path.join(process.env.LOCALAPPDATA ?? "", "Programs", "opencode", "opencode.exe"),
+  ]
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return "opencode"
+}
+
+/**
+ * Start the CLI server unless it is already answering.
+ *
+ * @param root - repository root (holds src/cli-server.ts and bin/config.json).
+ * @param port - port to serve on; the DSH plugin's default is 18080.
+ */
+export async function startFreeLane(
+  root: string,
+  port = 18080,
+  logger?: { info?: (message: string) => void; warn?: (message: string) => void },
+): Promise<void> {
+  state = { status: "starting", port }
+
+  // A lane started earlier (by a previous gateway run, or by hand) is reused rather than
+  // fought over: two servers on one port is the failure mode we are trying to remove.
+  if (await laneHealthy(port)) {
+    state.status = "ready"
+    logger?.info?.(`[Gateway] Free lane already serving on ${port}; reusing it.`)
+    return
+  }
+
+  const script = path.join(root, "src", "cli-server.ts")
+  const config = path.join(root, "bin", "config.json")
+
+  // Run the CLI server with the gateway's own Node: no cmd.exe in the chain. Routing a
+  // non-ASCII user name through a console host mangles USERPROFILE and the CLI then fails
+  // opening its log file.
+  const child = spawn(
+    process.execPath,
+    [
+      script,
+      "--port", String(port),
+      "--config", config,
+      "--model", "opencode/big-pickle",
+      "--models",
+      "big-pickle,deepseek-v4.1-flash-free,glm-5.3-flash-free,mimo-v2.6-flash-free,nemotron-3.5-super-vl-free",
+      "--opencode-path", resolveOpencodePath(),
+    ],
+    {
+      cwd: root,
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      detached: false,
+    },
+  )
+
+  state.child = child
+
+  let tail = ""
+  child.stdout?.on("data", (chunk: Buffer | string) => {
+    const text = String(chunk)
+    tail = (tail + text).slice(-2000)
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith("[cli-server]")) logger?.info?.(`[Gateway] ${trimmed}`)
+    }
+  })
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    tail = (tail + String(chunk)).slice(-2000)
+  })
+
+  child.on("exit", (code: number | null) => {
+    if (state.child === child && state.status === "ready") {
+      state.status = "failed"
+      state.error = `CLI server exited (code ${code})`
+      logger?.warn?.(`[Gateway] Free lane exited (code ${code}); free models are unavailable until the gateway restarts.`)
+    }
+  })
+
+  const deadline = Date.now() + READY_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      state.status = "failed"
+      state.error = `CLI server exited during startup (code ${child.exitCode}): ${tail.trim().slice(-300)}`
+      logger?.warn?.(`[Gateway] Free lane failed to start: ${state.error}`)
+      return
+    }
+    if (await laneHealthy(port)) {
+      state.status = "ready"
+      logger?.info?.(`[Gateway] Free lane ready on ${port}.`)
+      return
+    }
+    await sleep(READY_POLL_MS)
+  }
+
+  state.status = "failed"
+  state.error = `CLI server did not answer /healthz within ${READY_TIMEOUT_MS}ms`
+  logger?.warn?.(`[Gateway] ${state.error}`)
+}
+
+/** Stop the lane (gateway shutdown). A lane we merely reused is left alone. */
+export function stopFreeLane() {
+  const child = state.child
+  if (!child || child.exitCode !== null) return
+  try {
+    child.kill()
+  } catch {
+    void 0
+  }
+  state = { status: "disabled", port: state.port }
+}

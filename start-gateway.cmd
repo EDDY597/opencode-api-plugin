@@ -8,11 +8,11 @@ REM The gateway and its backend only reach their upstreams through the user's
 REM proxy (poisoned LAN DNS); if this shell lacks the vars, read them from the
 REM registry user environment.
 for %%n in (HTTPS_PROXY HTTP_PROXY NO_PROXY) do if not defined %%n call :fromreg %%n
-REM Free lane: the Go opencode2api service (bin\opencode2api.exe, config bin\config.json)
-REM serves the "free" upstream on 127.0.0.1:18080. It manages its own proxy exits, so it
-REM deliberately runs without the shell's HTTP(S)_PROXY. Reuse an instance already listening.
-netstat -ano | findstr ":18080" | findstr "LISTENING" >nul 2>nul
-if errorlevel 1 start "opencode2api" /min cmd /c ""%~dp0bin\opencode2api.exe" -config "%~dp0bin\config.json""
+REM Free lane: the gateway itself starts and stops src\cli-server.ts on port 18080 (see
+REM src\free-lane.ts). That binding is deliberate — the DSH plugin only registers free
+REM models if 18080 answers when the plugin loads, and a separate autostart entry kept
+REM losing that race. Do not start the lane here as well: the gateway reuses an existing
+REM listener, but two launchers fighting over the port is exactly what we removed.
 node "%~dp0src\standalone.ts"
 pause
 goto :eof

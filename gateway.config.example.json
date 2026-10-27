@@ -27,6 +27,17 @@
       "enabled": false
     },
     {
+      "id": "free-cli",
+      "name": "OpenCode Free via CLI",
+      "_note": "OpenCode's free tier is gated on the official client, not on an API key: a valid oc_sk_ key still gets FreeUsageLimitError over HTTP, while `opencode run` works with no credentials at all. Start this lane with start-cli-server.cmd (src/cli-server.ts, default 127.0.0.1:18081).",
+      "type": "openai",
+      "prefix": "free",
+      "baseURL": "http://127.0.0.1:18081/v1",
+      "apiKey": "unused",
+      "protocol": "openai",
+      "enabled": false
+    },
+    {
       "id": "commandcode-goal",
       "name": "Command Code",
       "type": "openai",

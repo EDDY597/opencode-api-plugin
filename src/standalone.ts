@@ -1,5 +1,10 @@
 import { createServer } from "node:http"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { createHandler, loadFileConfig } from "./gateway.ts"
+import { startFreeLane, stopFreeLane } from "./free-lane.ts"
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
 
 const fileConfig = loadFileConfig() ?? {}
 
@@ -31,6 +36,9 @@ const warmableLocalUpstreams = localUpstreams.filter((upstream) => upstream.enab
 function shutdown(signal: string) {
   console.log(`\n[Gateway] Received ${signal}, shutting down...`)
   for (const upstream of localUpstreams) upstream.local?.killBackend()
+  // The free lane is a child of this process: stopping the gateway must stop it too, or a
+  // stale 18080 survives and the next gateway run reuses a half-dead server.
+  stopFreeLane()
   server.close(() => process.exit(0))
   // Fallback if connections keep the server open.
   setTimeout(() => process.exit(0), 3000).unref()
@@ -102,6 +110,18 @@ server.listen(port, hostname, () => {
       ?.warmup()
       .then(() => console.log(`[Gateway] Local OpenCode backend ready for upstream '${upstream.id}'`))
       .catch((error: any) => console.error(`[Gateway] Local backend warmup failed for '${upstream.id}':`, error?.message))
+  }
+
+  // The free lane is owned by the gateway so its lifetime matches: the DSH plugin only
+  // registers free models if 18080 answers when the plugin loads, and a separate autostart
+  // entry kept losing that race. Skip it when the gateway has no enabled `free` upstream.
+  const freeUpstream = upstreams.find((upstream) => upstream.prefix === "free" && upstream.enabled)
+  if (freeUpstream) {
+    const port = Number(new URL(freeUpstream.baseURL).port || 18080)
+    void startFreeLane(ROOT, port, {
+      info: (message) => console.log(message),
+      warn: (message) => console.warn(message),
+    })
   }
 })
 
