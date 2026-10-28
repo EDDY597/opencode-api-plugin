@@ -272,6 +272,31 @@ DSH 插件 ──► :18080 ────┘
 `Stop-Process` 网关后，18090 与 18080 一并消失。重启 DSH / 网关不会留下孤儿进程，
 也不会出现「端口被上一代实例占着」。
 
+**运行期自愈已验证**（2026-10-28）：`src/lane-watchdog.ts` 每 30 秒探一次本地端口
+（`oc2api/health`、`shim/healthz`，都是静态响应，**不花额度**），哪条挂了就重启哪条。
+实测：杀掉 oc2api → 45 秒内以新 pid 回来、父进程仍是网关；杀掉 18080 shim → 同样自愈。
+间隔可用 `OPENCODE_LANE_WATCHDOG_MS` 覆盖（最小 5000）。
+
+### DSH 插件为什么"必须让它一加载就健康"
+
+插件只在**加载那一刻**判一次：`buildFreeRuntime()` 探 `18080/healthz`，失败就把
+`freeRuntime` 置空并记一条 error。之后那个 60 秒的定时器只刷新**模型列表**
+（`refreshOnce`），**不会重建 runtime**——所以本会话免费模型就没了，只能重启 DSH。
+
+它原来还有一层兜底：18080 不健康时自己去 spawn `bin\opencode2api.exe`。**那个文件已经不存在**，
+所以现在没有兜底，只有：
+
+| 防线 | 覆盖什么 | 位置 |
+| --- | --- | --- |
+| `HKCU\...\Run` → `start-gateway-hidden.vbs` | 开机时把网关拉起来 | 用户级自启，无需管理员 |
+| `lane-watchdog.ts` | 网关运行中 lane 挂掉 | 网关进程内 |
+| 人工重启 DSH | 开机时 DSH 抢在网关前面加载了插件 | 唯一残余风险 |
+
+**残余风险**：Run 键与 DSH 的自启顺序没有保证。如果开机时 DSH 先加载插件、而网关还没把
+18080 起来，这次会话就没有免费模型——**重启一次 DSH 即可**（那时网关必然已在跑）。
+要彻底消除，只能改插件让它失败后重建 runtime（插件在 `E:\Agent\dsh-opencode-gateway`，
+是独立仓库，改完要 build + 重启 DSH）。
+
 **已验证的链路**：
 - 网关 `free/glm-5.3-flash-free` → 200 / 1.3s
 - 18080 shim（带 `server_keys[0]`）→ 200 / 2.3–3.0s，模型列表跟随 oc2api（9 个）
@@ -451,8 +476,12 @@ foreach ($pt in @(18090,18080)) { netstat -ano | Select-String ":$pt\s" | Select
   指纹）。查模型可用性必须**逐个试**，不能抽样一个就下结论。
 - **额度用量无法提前查询。** 免费层没有额度查询接口（`/usage`、`/account`、
   `/config/providers` 均无），只能靠真实请求撞出来。oc2api 的 `/health` 与 `/ip` 也不含额度。
-- **启动顺序仍是软约束。** 若 DSH 在 18080 就绪前加载插件，本次会话不会注册 free
-  模型，只能重启 DSH。网关现在会自己拉起 18090 与 18080，但网关本身仍须在 DSH 之前起来。
+- **启动顺序仍是软约束，但已加防线。** 若 DSH 在 18080 就绪前加载插件，本次会话不会注册
+  free 模型，只能重启 DSH。现有三条防线（Run 键自启 / 网关内 watchdog / 人工重启 DSH）见
+  「DSH 插件为什么必须让它一加载就健康」；残余风险只剩开机竞态。
+- **Run 键是用户级的，不是计划任务。** `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  里的 `OpenCodeGateway` = `wscript.exe "<repo>\start-gateway-hidden.vbs"`。不要改成
+  `schtasks`——这台机器没有管理员权限（见下表）。删掉这一项就等于关掉开机自启。
 - **`go/v1` 与免费通道的 403/429 现在没有分开翻译。** `isFatalUpstreamError` 把 401/402/403
   一律当「不可重试」，方向是对的；但 `cli-server` 侧仍把「无响应」笼统说成「额度耗尽」。
   若将来再出现「等一天也没好」的报障，先看 CLI 日志里是 `FreeUsageLimitError`（真额度）

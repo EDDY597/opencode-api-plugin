@@ -4,8 +4,12 @@ import { fileURLToPath } from "node:url"
 import { createHandler, loadFileConfig } from "./gateway.ts"
 import { startFreeLane, stopFreeLane } from "./free-lane.ts"
 import { startOc2apiLane, stopOc2apiLane } from "./oc2api-lane.ts"
+import { loopbackHealthy, startLaneWatchdog, type LaneTarget } from "./lane-watchdog.ts"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
+
+/** Set once the lanes are up; cleared by shutdown. */
+let stopWatchdog: (() => void) | undefined
 
 const fileConfig = loadFileConfig() ?? {}
 
@@ -37,6 +41,9 @@ const warmableLocalUpstreams = localUpstreams.filter((upstream) => upstream.enab
 function shutdown(signal: string) {
   console.log(`\n[Gateway] Received ${signal}, shutting down...`)
   for (const upstream of localUpstreams) upstream.local?.killBackend()
+  // Stop the watchdog before the lanes so it cannot resurrect one mid-shutdown.
+  stopWatchdog?.()
+  stopWatchdog = undefined
   // The free lane is a child of this process: stopping the gateway must stop it too, or a
   // stale 18080 survives and the next gateway run reuses a half-dead server.
   stopOc2apiLane()
@@ -133,23 +140,50 @@ server.listen(port, hostname, () => {
 
   const oc2apiPort = Number(oc2api.port ?? 18090)
   const oc2apiBase = `http://127.0.0.1:${oc2apiPort}/v1`
+  const shimPort = Number(cliLane.port ?? 18080)
+  const laneLogger = {
+    info: (message: string) => console.log(message),
+    warn: (message: string) => console.warn(message),
+  }
+  const oc2apiOptions = { root: ROOT, port: oc2apiPort, apiKey: String(oc2api.apiKey ?? ""), logger: laneLogger }
+  const shimOptions = {
+    httpBase: oc2apiBase,
+    apiKey: oc2api.apiKey ? String(oc2api.apiKey) : undefined,
+  }
 
   void (async () => {
+    if (oc2api.enabled !== false) await startOc2apiLane(oc2apiOptions)
+    if (cliLane.enabled === true) await startFreeLane(ROOT, shimPort, laneLogger, shimOptions)
+
+    // The DSH plugin judges the free route once, when it loads, and its 60s refresh
+    // loop only refreshes the model *listing* -- it does not rebuild the runtime. So a
+    // lane that dies while the gateway is up costs the user their free models until they
+    // restart DSH. Keep both lanes answering instead; the probes are loopback-only and
+    // spend no quota.
+    const targets: LaneTarget[] = []
     if (oc2api.enabled !== false) {
-      await startOc2apiLane({
-        root: ROOT,
-        port: oc2apiPort,
-        apiKey: String(oc2api.apiKey ?? ""),
-        logger: { info: (message) => console.log(message), warn: (message) => console.warn(message) },
+      targets.push({
+        name: `oc2api :${oc2apiPort}`,
+        check: () => loopbackHealthy(`http://127.0.0.1:${oc2apiPort}/health`),
+        restart: async () => {
+          stopOc2apiLane()
+          await startOc2apiLane(oc2apiOptions)
+        },
       })
     }
-
     if (cliLane.enabled === true) {
-      const lanePort = Number(cliLane.port ?? 18080)
-      await startFreeLane(ROOT, lanePort, {
-        info: (message) => console.log(message),
-        warn: (message) => console.warn(message),
-      }, { httpBase: oc2apiBase, apiKey: oc2api.apiKey ? String(oc2api.apiKey) : undefined })
+      targets.push({
+        name: `free shim :${shimPort}`,
+        check: () => loopbackHealthy(`http://127.0.0.1:${shimPort}/healthz`),
+        restart: async () => {
+          stopFreeLane()
+          await startFreeLane(ROOT, shimPort, laneLogger, shimOptions)
+        },
+      })
+    }
+    if (targets.length) {
+      const interval = Number(process.env.OPENCODE_LANE_WATCHDOG_MS ?? 30_000)
+      stopWatchdog = startLaneWatchdog(targets, laneLogger, Number.isFinite(interval) && interval >= 5_000 ? interval : 30_000)
     }
   })()
 })
