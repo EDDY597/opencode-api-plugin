@@ -1,4 +1,16 @@
 @echo off
+REM ============================================================================
+REM SUPERSEDED (2026-10-28). Do NOT run this alongside the gateway any more.
+REM
+REM The gateway now owns port 18080 itself: src\standalone.ts starts
+REM src\cli-server.ts as its child (gateway.config.json "lanes.cliServer"), and that
+REM child forwards to bin\oc2api.exe on 18090. Two supervisors racing for 18080 is the
+REM exact failure mode that ownership was introduced to remove.
+REM
+REM Keep this file only for the case where you deliberately run the lane WITHOUT the
+REM gateway. If both run, this loop and the gateway will fight over the port.
+REM ============================================================================
+REM
 REM Keep the CLI free-lane server alive on 127.0.0.1:18080.
 REM
 REM Why a supervisor instead of a one-shot start: the DSH plugin auto-manages port 18080

@@ -1,10 +1,11 @@
 # Stop the LLM gateway started by start-gateway.cmd / start-gateway-hidden.vbs / the tray.
-# taskkill /F /T kills the whole tree, so the node runtime and the embedded
-# "opencode serve" backend (its child process) both go down. The tray watches the
-# gateway over /health, so it closes itself shortly after the kill.
-# The free lane's Go opencode2api service (bin\opencode2api.exe, port from
-# bin\config.json "listen", default 18080) runs outside the gateway's process tree,
-# so it is stopped separately below.
+# taskkill /F /T kills the whole tree, which since 2026-10-28 also covers both free lanes:
+# bin\oc2api.exe (18090) and src\cli-server.ts (18080) are spawned by the gateway, so they
+# die with it. The tray watches the gateway over /health, so it closes itself shortly after.
+#
+# The per-port sweep at the bottom is now a leftover guard: it catches a lane started by
+# hand (or by an older gateway) that is not inside this tree. It matches on the executable
+# and script name, so an unrelated listener on that port is never touched.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File stop-gateway.ps1 [port]

@@ -20,15 +20,9 @@ node = "node"
 If fso.FileExists("C:\Program Files\nodejs\node.exe") Then
   node = """C:\Program Files\nodejs\node.exe"""
 End If
-' Free lane: start the Go opencode2api service (bin\opencode2api.exe) unless port
-' 18080 already has a listener. It manages its own proxy exits via bin\config.json.
-listening18080 = False
-Set probe = shell.Exec("netstat -ano")
-Do Until probe.StdOut.AtEndOfStream
-  line = probe.StdOut.ReadLine()
-  If InStr(line, ":18080") > 0 And InStr(line, "LISTENING") > 0 Then listening18080 = True
-Loop
-If Not listening18080 Then
-  shell.Run """" & here & "\bin\opencode2api.exe"" -config """ & here & "\bin\config.json""", 0, False
-End If
+' Free lane: the gateway owns every local lane itself now (src\standalone.ts starts
+' bin\oc2api.exe on 18090 and src\cli-server.ts on 18080; see "lanes" in
+' gateway.config.json). Start nothing here. This script used to launch
+' bin\opencode2api.exe, which no longer exists, so that step could only fail
+' silently right before the gateway started the real lane anyway.
 shell.Run node & " """ & here & "\src\standalone.ts""", 0, False
