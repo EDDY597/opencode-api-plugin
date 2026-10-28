@@ -62,6 +62,7 @@
 | `429` + `Retry-After` **指向下一个 UTC 零点**（误差 ≤3 分钟） | **额度耗尽** | 等到那个时刻，不要重试 |
 | `429` + `Retry-After` **指向别处** | **不是额度** | 按指纹 / 上游限流排查 |
 | `429` 没有 `Retry-After` | 不是纯额度 | 按指纹排查 |
+| **`402 insufficient_quota`**（"Free usage exceeded, subscribe to Go"） | **同样是额度耗尽** | 2026-10-24 实测出现过；别因为它不是 429 就当成别的错 |
 | 跨过一个 UTC 零点后**仍是 429**，且 `Retry-After` 又指向下一个零点 | **指纹变了** | 额度每天会回来，指纹不会 |
 
 一条现成的判据脚本（默认零额度，`--probe` 才发 1 次 `max_tokens=1` 的请求）：
@@ -474,8 +475,27 @@ foreach ($pt in @(18090,18080)) { netstat -ano | Select-String ":$pt\s" | Select
 - **`beam-free` 单模型地区受限，不代表全部免费模型。** 2026-10-27：`beam-free` → 403
   `RegionError`；同一条链路、同一凭据下 `glm-5.3-flash-free` / `big-pickle` → 429（当时是
   指纹）。查模型可用性必须**逐个试**，不能抽样一个就下结论。
-- **额度用量无法提前查询。** 免费层没有额度查询接口（`/usage`、`/account`、
-  `/config/providers` 均无），只能靠真实请求撞出来。oc2api 的 `/health` 与 `/ip` 也不含额度。
+- **额度用量无法提前查询，官方也不公布配额数字。** 2026-10-28 查过官方文档
+  （`opencode.ai/v2/docs/console/models`）：它只列出**免费模型的名单**、定价写 `Free`、
+  每项注 "available for a limited time"，**没有任何次数/ token 数字**；也没有查询接口
+  （`/usage`、`/account`、`/config/providers` 均无）。能确定的只有「按 UTC 日重置」。
+  因此回答「还剩多少」时只能给**已用量**，不能给上限：
+
+  ```powershell
+  # 今天实际调过多少次上游（零额度，纯读日志）
+  Select-String -Path gateway-debug.log -Pattern '--> .*model=' |
+    Where-Object { $_.Line -match '^2026-10-28' } |
+    ForEach-Object { [regex]::Match($_.Line,'model=(\S+)').Groups[1].Value } |
+    Group-Object | Sort-Object Count -Descending
+  ```
+
+  2026-10-28 实测：当天 89 次上游调用，其中免费档仅 **9 次**（其余 80 次走
+  `go/deepseek-v4.1-flash`）。历史日志（10-17 起）里免费档总量约 112 次，11 天平均每天
+  10 次左右——**从来没接近过上限**，唯一一次耗尽发生在 10-24，且是以 `402` 形态出现的。
+- **免费模型池本身也在变。** 官方文档 2026-10-28 列了 11 个（含 `nemotron-3-ultra-free`），
+  而当天 `/inference/v1/models` 只返回 9 个——`nemotron-3-ultra-free` 已不在列表里，
+  但 `gateway-debug.log` 里 10 月中旬还有它的调用记录。**名单以 `/models` 实时结果为准**，
+  不要照抄文档。
 - **启动顺序仍是软约束，但已加防线。** 若 DSH 在 18080 就绪前加载插件，本次会话不会注册
   free 模型，只能重启 DSH。现有三条防线（Run 键自启 / 网关内 watchdog / 人工重启 DSH）见
   「DSH 插件为什么必须让它一加载就健康」；残余风险只剩开机竞态。

@@ -85,6 +85,15 @@ def classify(status, body: str, headers: dict) -> tuple[str, str]:
     if status == 426 or "upgrade required" in text:
         return "VERSION", "客户端自称的版本过旧 —— 升级 oc2api。"
 
+    # The free tier has reported exhaustion as 402 insufficient_quota at least once
+    # (2026-10-24, "Free usage exceeded, subscribe to Go"), not only as 429. Both mean
+    # the same thing, so neither may fall through to UNKNOWN.
+    if status == 402 or "free usage exceeded" in text or "insufficient_quota" in text:
+        return "QUOTA", (
+            "额度耗尽。历史上这条以 402 `insufficient_quota`（Free usage exceeded）出现过，"
+            "不是 429；按 UTC 日重置，等到那个时刻即可。"
+        )
+
     if status == 429 or "freeusagelimit" in text:
         raw = headers.get("retry-after") or headers.get("Retry-After")
         if not raw:
