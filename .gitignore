@@ -6,3 +6,4 @@ node_modules/
 .zcode/
 config.json
 bin/
+__pycache__/
