@@ -47,6 +47,38 @@
   哪种客户端发的，再决定要不要等。
 - `go/` 路由不受影响：它不走免费层，`zen/go/v1` 对普通 HTTPS 客户端是开放的（实测 200）。
 
+### 怎么判断「额度用完了」还是「指纹被改了」
+
+两种失败的响应**长得几乎一样**（都是 `429 FreeUsageLimitError` + `Retry-After`），所以不能
+凭"429"下结论。判据如下，**前提是探测必须从 oc2api 发**——Node 的 429 永远是指纹拒绝，
+拿它判断额度必然误判。
+
+| 观测 | 判定 | 处置 |
+| --- | --- | --- |
+| `200` | 正常 | — |
+| `403 FreeTierError` | **指纹/形状变了**（oc2api 失效的典型信号） | 拉上游最新源码重建 `bin\oc2api.exe`；或临时切 `OPENCODE_CLI_TRANSPORT=cli` |
+| `426 Upgrade Required` | 客户端自称的版本过旧 | 升级 oc2api |
+| `403 RegionError` | **该模型**地区受限（`beam-free` 就是这样） | 换一个免费模型，与额度/指纹无关 |
+| `429` + `Retry-After` **指向下一个 UTC 零点**（误差 ≤3 分钟） | **额度耗尽** | 等到那个时刻，不要重试 |
+| `429` + `Retry-After` **指向别处** | **不是额度** | 按指纹 / 上游限流排查 |
+| `429` 没有 `Retry-After` | 不是纯额度 | 按指纹排查 |
+| 跨过一个 UTC 零点后**仍是 429**，且 `Retry-After` 又指向下一个零点 | **指纹变了** | 额度每天会回来，指纹不会 |
+
+一条现成的判据脚本（默认零额度，`--probe` 才发 1 次 `max_tokens=1` 的请求）：
+
+```powershell
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8   # 否则 GBK 控制台下中文是乱码
+python scripts\check-free-lane.py            # 进程/端口/health/models，全都不花额度
+python scripts\check-free-lane.py --probe    # 区分额度 vs 指纹，花 1 次
+```
+
+脚本会把上次 429 的时间记到 `%TEMP%\opencode-free-lane-state.json`，用来支撑最后那条
+「跨日仍 429」的判据。
+
+**为什么不能只看「等了也没好」**：上游的额度是按 UTC 日给的，如果这个出口被别人抢光，
+你今天等到了零点也可能几分钟内又被薅完——那仍然是额度，不是指纹。所以判据要用
+`Retry-After` 的**指向**，而不是"等一等有没有好"。
+
 ### 免费模型的通道：oc2api（uTLS）> CLI（Bun）> Node（不可用）
 
 | 通道 | 能出网 | 流式 | 工具 | 延迟 | 进程 |
