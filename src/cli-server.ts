@@ -185,6 +185,40 @@ function servedModels(primary: string | undefined): string[] {
   return [...new Set(ids.length ? ids : ["big-pickle"])]
 }
 
+/** Cached model discovery for the HTTP transport (which sits in front of oc2api). */
+let discoveredCache: { at: number; ids: string[] } | undefined
+
+/**
+ * Ask the HTTP upstream for its model list.
+ *
+ * With `--transport http` this lane is a forwarder, and the upstream (oc2api) already
+ * filters to `big-pickle` + `*-free` and refreshes that list itself. Reading it beats
+ * pinning ids in the launch arguments, which go stale the moment upstream adds or
+ * retires a free model. Any failure returns undefined so the caller falls back to the
+ * static list: a listing must always answer, even when the upstream is down.
+ */
+async function discoveredModels(): Promise<string[] | undefined> {
+  if (opts.transport !== "http") return undefined
+  const now = Date.now()
+  if (discoveredCache && now - discoveredCache.at < 60_000) return discoveredCache.ids
+  try {
+    const response = await fetch(`${opts.httpBaseUrl.replace(/\/+$/, "")}/models`, {
+      headers: { authorization: `Bearer ${opts.httpKey}` },
+      signal: AbortSignal.timeout(5_000),
+    })
+    if (!response.ok) return undefined
+    const body: any = await response.json()
+    const ids = (body?.data ?? [])
+      .map((entry: any) => (typeof entry === "string" ? entry : entry?.id))
+      .filter((id: any) => typeof id === "string" && id.length > 0)
+    if (!ids.length) return undefined
+    discoveredCache = { at: now, ids }
+    return ids
+  } catch {
+    return undefined
+  }
+}
+
 /** Flatten a chat message's content to plain text (the upstream takes strings here). */
 function messageText(content: any): string {
   if (typeof content === "string") return content
@@ -668,12 +702,13 @@ const server = createServer(async (req, res) => {
     // configured menu uses bare ids, so a prefixed listing matches nothing and the card
     // reports "端点返回了空模型列表". A bare listing also keeps the ids usable as-is when
     // they are echoed back in a chat request.
+    const ids = (await discoveredModels()) ?? servedModels(opts.model)
     json(res, 200, {
       object: "list",
-      data: servedModels(opts.model).map((id) => ({
+      data: ids.map((id) => ({
         id,
         object: "model",
-        owned_by: "opencode-cli",
+        owned_by: opts.transport === "http" ? "oc2api" : "opencode-cli",
         created: Math.floor(Date.now() / 1000),
       })),
     })

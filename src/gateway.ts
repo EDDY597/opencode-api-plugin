@@ -1149,7 +1149,14 @@ function configPaths(): string[] {
 export function loadFileConfig(): any {
   for (const path of configPaths()) {
     try {
-      if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"))
+      if (!existsSync(path)) continue
+      // Windows editors and `Set-Content -Encoding UTF8` (PowerShell 5.1) prepend a BOM,
+      // and JSON.parse rejects it. Swallowing that as "this file does not parse" made the
+      // loader silently fall through to the NEXT candidate — which is the production
+      // config. The symptom is "I changed the config and nothing happened", with the
+      // process listening on the old port. Strip it instead of skipping the file.
+      const text = readFileSync(path, "utf8").replace(/^\uFEFF/, "")
+      return JSON.parse(text)
     } catch {
       continue
     }
@@ -1261,6 +1268,12 @@ export type UpstreamConfig = {
   // reverse-maps request model ids back before forwarding.
   modelRewrite?: Record<string, string>
   sessionHeader?: boolean
+  /**
+   * Which local process serves this upstream, so the gateway can start and stop it.
+   * "oc2api" = bin/oc2api.exe (uTLS to zen); "cli" = src/cli-server.ts on 18080.
+   * Only meaningful with a loopback baseURL.
+   */
+  lane?: "oc2api" | "cli"
   headers?: Record<string, string>
   authHeader?: "bearer" | "x-api-key" | "both" | "none"
   stripParams?: string[]
@@ -1309,6 +1322,7 @@ type Upstream = {
   models?: string[]
   modelRewrite?: [string, string][]
   sessionHeader: boolean
+  lane?: "oc2api" | "cli"
   headers: Record<string, string>
   authHeader?: "bearer" | "x-api-key" | "both" | "none"
   stripParams: string[]
@@ -1403,6 +1417,7 @@ export function buildUpstreams(config: any = {}): Upstream[] {
       models,
       modelRewrite,
       sessionHeader: raw.sessionHeader ?? preset,
+      lane: raw.lane,
       headers: raw.headers ?? {},
       authHeader: raw.authHeader,
       stripParams: raw.stripParams ?? [],

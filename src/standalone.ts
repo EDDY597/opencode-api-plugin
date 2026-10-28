@@ -1,19 +1,11 @@
 import { createServer } from "node:http"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { createHandler, isLoopbackHost, loadFileConfig } from "./gateway.ts"
+import { createHandler, loadFileConfig } from "./gateway.ts"
 import { startFreeLane, stopFreeLane } from "./free-lane.ts"
+import { startOc2apiLane, stopOc2apiLane } from "./oc2api-lane.ts"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
-
-/** True when an upstream base URL points at this machine (the CLI lane on 18080). */
-function isLocalUrl(baseURL: string): boolean {
-  try {
-    return isLoopbackHost(new URL(baseURL).hostname)
-  } catch {
-    return false
-  }
-}
 
 const fileConfig = loadFileConfig() ?? {}
 
@@ -47,6 +39,7 @@ function shutdown(signal: string) {
   for (const upstream of localUpstreams) upstream.local?.killBackend()
   // The free lane is a child of this process: stopping the gateway must stop it too, or a
   // stale 18080 survives and the next gateway run reuses a half-dead server.
+  stopOc2apiLane()
   stopFreeLane()
   server.close(() => process.exit(0))
   // Fallback if connections keep the server open.
@@ -121,25 +114,44 @@ server.listen(port, hostname, () => {
       .catch((error: any) => console.error(`[Gateway] Local backend warmup failed for '${upstream.id}':`, error?.message))
   }
 
-  // The free lane is owned by the gateway so its lifetime matches: the DSH plugin only
-  // registers free models if 18080 answers when the plugin loads, and a separate autostart
-  // entry kept losing that race.
+  // Both local lanes are children of this process, so their lifetime matches the gateway
+  // and no separate autostart entry has to win a race against the DSH plugin's load.
   //
-  // Only start it when the `free` upstream actually points at that local CLI server. When
-  // the free lane is plain HTTPS (the default: `free-http` → https://opencode.ai/zen/v1)
-  // there is no local server to own, and spawning cli-server would add two idle processes
-  // plus a 18080 listener for nothing — and its port would still be derived from a remote
-  // URL's (empty) port, i.e. 18080 by accident.
-  const freeUpstream = upstreams.find(
-    (upstream) => upstream.prefix === "free" && upstream.enabled && isLocalUrl(upstream.baseURL),
-  )
-  if (freeUpstream) {
-    const port = Number(new URL(freeUpstream.baseURL).port || 18080)
-    void startFreeLane(ROOT, port, {
-      info: (message) => console.log(message),
-      warn: (message) => console.warn(message),
-    })
-  }
+  // Order matters: cli-server is a plain forwarder when pointed at oc2api, so oc2api has
+  // to be up first. `lanes` in gateway.config.json decides what runs:
+  //
+  //   lanes.oc2api     { enabled, port, apiKey }  — bin/oc2api.exe, uTLS to zen
+  //   lanes.cliServer  { enabled, port }          — src/cli-server.ts, the 18080 shim
+  //                                                 the DSH plugin expects
+  //
+  // Node cannot reach zen for free models at all (TLS fingerprint, measured 2026-10-28),
+  // so a cliServer lane with no oc2api behind it can only fail; it is started anyway when
+  // asked, and its own logs say why a request failed.
+  const lanes = (fileConfig as any).lanes ?? {}
+  const oc2api: any = lanes.oc2api ?? {}
+  const cliLane: any = lanes.cliServer ?? {}
+
+  const oc2apiPort = Number(oc2api.port ?? 18090)
+  const oc2apiBase = `http://127.0.0.1:${oc2apiPort}/v1`
+
+  void (async () => {
+    if (oc2api.enabled !== false) {
+      await startOc2apiLane({
+        root: ROOT,
+        port: oc2apiPort,
+        apiKey: String(oc2api.apiKey ?? ""),
+        logger: { info: (message) => console.log(message), warn: (message) => console.warn(message) },
+      })
+    }
+
+    if (cliLane.enabled === true) {
+      const lanePort = Number(cliLane.port ?? 18080)
+      await startFreeLane(ROOT, lanePort, {
+        info: (message) => console.log(message),
+        warn: (message) => console.warn(message),
+      }, { httpBase: oc2apiBase, apiKey: oc2api.apiKey ? String(oc2api.apiKey) : undefined })
+    }
+  })()
 })
 
 process.on("SIGINT", () => shutdown("SIGINT"))

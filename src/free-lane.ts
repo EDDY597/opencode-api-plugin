@@ -81,11 +81,17 @@ function resolveOpencodePath(): string {
  *
  * @param root - repository root (holds src/cli-server.ts and bin/config.json).
  * @param port - port to serve on; the DSH plugin's default is 18080.
+ * @param logger - where the child's own log lines go.
+ * @param forwarding - when set, run cli-server as a plain HTTP forwarder to this base
+ *   URL (in practice the local oc2api lane) instead of driving the opencode binary.
+ *   That is the configuration the DSH plugin gets: 18080 must keep answering, but Node
+ *   cannot reach zen itself, so oc2api does the TLS.
  */
 export async function startFreeLane(
   root: string,
   port = 18080,
   logger?: { info?: (message: string) => void; warn?: (message: string) => void },
+  forwarding?: { httpBase: string; apiKey?: string },
 ): Promise<void> {
   state = { status: "starting", port }
 
@@ -111,8 +117,13 @@ export async function startFreeLane(
       "--config", config,
       "--model", "opencode/big-pickle",
       "--models",
-      "big-pickle,deepseek-v4.1-flash-free,glm-5.3-flash-free,mimo-v2.6-flash-free,nemotron-3.5-super-vl-free",
+      // Fallback only: with forwarding enabled cli-server reads the live list from oc2api
+      // (60s cache) and uses these just when that read fails. Keep them roughly current.
+      "big-pickle,beam-free,flint-40b-free,mimo-v2.6-flash-free,nemotron-3.5-super-vl-free,nemotron-3.5-lightning-free,jev-1.13-free,deepseek-v4.1-flash-free,glm-5.3-flash-free",
       "--opencode-path", resolveOpencodePath(),
+      ...(forwarding
+        ? ["--transport", "http", "--http-base", forwarding.httpBase, ...(forwarding.apiKey ? ["--http-key", forwarding.apiKey] : [])]
+        : ["--transport", "cli"]),
     ],
     {
       cwd: root,
