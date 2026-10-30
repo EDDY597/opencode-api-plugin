@@ -30,6 +30,10 @@
 
 - **Node ≥ 22.6**：源码是 TypeScript，靠 Node 原生类型剥离直接运行（仓库不发布构建产物）。启动脚本已优先使用 `C:\Program Files\nodejs` 的安装，避免被 PATH 里的旧版 Node 干扰。
 - Windows 下可用附带的 cmd/vbs/托盘脚本；其他平台直接 `node src/standalone.ts`。
+- **免费档额外需要 `bin\oc2api.exe`**：第三方 Go 二进制，`bin/` 被 gitignore，所以仓库里没有。装法二选一——
+  从 [Releases](https://github.com/EDDY597/opencode-api-plugin/releases) 下 `oc2api-<上游 tag>` 的 `oc2api.exe`
+  （Actions 里的 `oc2api-release` 工作流编译 + 冒烟后发布），或按 `AGENTS.md`「构建 oc2api 二进制」用 Go 1.24+ 自己编。
+  没有它时网关照常启动，只是 `free/` 模型不可用（日志报 `oc2api binary not found`）。
 
 ## 快速开始
 
@@ -184,7 +188,7 @@ curl http://127.0.0.1:8787/v1/models
 
 因此推荐顺序是：先 `opencode auth login`（`opencode auth list` 能确认当前账号），网关就不需要写 Key；要指定另一个账号时，再在 `gateway.config.json` 里加 `apiKey`，或给网关进程设 `OPENCODE_GO_API_KEY`。三者同时存在时按上面的优先级覆盖。
 
-> 免费档当前由 `bin\` 下的 Go 版 [opencode2api](https://github.com/jasonxu114514/opencode2api) 服务提供（启动脚本自动拉起，详见下文「实战：免费模型」），Go 订阅模型才需要上面的配置。
+> 免费档当前由 `bin\` 下的 Go 版 [oc2api](https://github.com/zhuweiyou/oc2api) 服务提供（启动脚本自动拉起，详见下文「实战：免费模型」）。`bin/` 不进 git，`oc2api.exe` 从本仓库 [Releases](https://github.com/EDDY597/opencode-api-plugin/releases) 的 `oc2api-<上游 tag>` 资产下载，或按 `AGENTS.md`「构建 oc2api 二进制」从源码构建。Go 订阅模型才需要上面的配置。
 
 ## 模型命名与协议路由
 

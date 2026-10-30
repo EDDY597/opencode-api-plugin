@@ -1,0 +1,152 @@
+# Builds the oc2api binary that `bin/` needs but git never carries (`bin/` is
+# gitignored — see AGENTS.md), and publishes it as a GitHub Release asset.
+#
+# Why a release and not a committed binary: `bin/oc2api.exe` is a 13 MB third-party
+# build (uTLS/BoringSSL ClientHello, ~46 MB once the mihomo kernel is linked in).
+# Committing it would bloat history with a fresh full copy on every rebuild. A
+# release asset gives cloud/machine-B users the exact same bytes with a one-line
+# download, while `bin/` stays unwatched.
+#
+# Upstream has no LICENSE file and publishes no release binaries, so building it is
+# the only way to obtain the exe. The license notice on record is MIT (via the
+# sibling project jasonxu114514/opencode2api); keep that attribution when redistributing.
+name: oc2api-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream zhuweiyou/oc2api tag to build (e.g. v4.4.0)"
+        required: true
+        default: "v4.4.0"
+      release_tag:
+        description: "Release tag to publish. Empty = oc2api-<upstream_tag>"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "oc2api-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: oc2api-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Resolve tags
+        id: tags
+        shell: pwsh
+        run: |
+          $upstream = "${{ inputs.upstream_tag }}"
+          $release = "${{ inputs.release_tag }}"
+          if ([string]::IsNullOrWhiteSpace($upstream)) {
+            # Triggered by a `oc2api-vX.Y.Z` tag push: the tag names the upstream release.
+            $ref = "${{ github.ref_name }}"
+            if ($ref -match '^oc2api-(v\d+\.\d+\.\d+)$') { $upstream = $Matches[1] }
+            else { throw "cannot derive upstream tag from '$ref'" }
+          }
+          if ([string]::IsNullOrWhiteSpace($release)) { $release = "oc2api-$upstream" }
+          "upstream=$upstream" >> $env:GITHUB_OUTPUT
+          "release=$release"   >> $env:GITHUB_OUTPUT
+
+      - name: Check out upstream
+        uses: actions/checkout@v4
+        with:
+          repository: zhuweiyou/oc2api
+          ref: ${{ steps.tags.outputs.upstream }}
+          path: upstream
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # go.mod says `go 1.24`; GOARCH/GOOS are pinned so the toolchain cannot
+          # silently pick up a newer language version (matches AGENTS.md: GOTOOLCHAIN=local).
+          go-version: "1.24"
+          cache-dependency-path: upstream/go.sum
+
+      - name: Build
+        shell: pwsh
+        working-directory: upstream
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          # Mirrors AGENTS.md: `go build -o oc2api.exe ./cmd/oc2api`, full build
+          # (mihomo kernel included) so Clash subscriptions work like a Docker/local build.
+          go build -trimpath -o oc2api.exe ./cmd/oc2api
+          if ($LASTEXITCODE -ne 0) { throw "go build failed ($LASTEXITCODE)" }
+
+      - name: Smoke test
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          # /health and /models are static/local: this spends no quota. They are also
+          # exactly what the gateway probes before it accepts the lane
+          # (src/oc2api-lane.ts -> laneHealthy), so a binary that fails here is unusable.
+          $env:PORT = "18090"
+          $env:API_KEY = "smoke-test-key"
+          $proc = Start-Process -FilePath "$PWD\oc2api.exe" -PassThru -WindowStyle Hidden
+          try {
+            $ok = $false
+            foreach ($i in 1..30) {
+              Start-Sleep -Milliseconds 500
+              if ($proc.HasExited) { break }
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:18090/health" -TimeoutSec 2
+                if ($health.status -eq "ok") { $ok = $true; break }
+              } catch { }
+            }
+            if (-not $ok) { throw "oc2api /health never reported status=ok" }
+            $models = Invoke-RestMethod -Uri "http://127.0.0.1:18090/models" -Headers @{ Authorization = "Bearer $env:API_KEY" } -TimeoutSec 5
+            $count = @($models.data).Count
+            if ($count -lt 1) { throw "/models returned no entries" }
+            Write-Host "/health ok; /models returned $count models"
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Hash and name the artifact
+        id: artifact
+        shell: pwsh
+        run: |
+          $exe = "upstream/oc2api.exe"
+          $sha = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
+          $size = (Get-Item $exe).Length
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "size=$size" >> $env:GITHUB_OUTPUT
+          "$sha  oc2api.exe" | Out-File -Encoding ascii oc2api.exe.sha256
+          Copy-Item $exe oc2api.exe
+          "built oc2api.exe: $size bytes, sha256 $sha"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.release }}
+          name: "oc2api ${{ steps.tags.outputs.upstream }} (windows-amd64)"
+          body: |
+            Prebuilt `oc2api.exe` for the free-model lane, compiled from
+            [zhuweiyou/oc2api@`${{ steps.tags.outputs.upstream }}`](https://github.com/zhuweiyou/oc2api/tree/${{ steps.tags.outputs.upstream }})
+            (`go build ./cmd/oc2api`, windows/amd64, full build with the mihomo kernel).
+
+            - size: `${{ steps.artifact.outputs.size }}` bytes
+            - sha256: `${{ steps.artifact.outputs.sha256 }}`
+            - verified: `/health` reports `status=ok`, `/models` answers with `API_KEY` set
+
+            **Install** (from the repo root, i.e. next to `src/`):
+
+            ```powershell
+            New-Item -ItemType Directory -Force bin | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/${{ steps.tags.outputs.release }}/oc2api.exe" -OutFile bin\oc2api.exe
+            # verify, then start the gateway: the lane spawns bin\oc2api.exe with PORT + API_KEY
+            (Get-FileHash -Algorithm SHA256 bin\oc2api.exe).Hash.ToLower()  # expect ${{ steps.artifact.outputs.sha256 }}
+            ```
+
+            Keep an existing `bin\config.json` — it holds `server_keys` and is machine-specific.
+          files: |
+            oc2api.exe
+            oc2api.exe.sha256
+          fail_on_unmatched_files: true

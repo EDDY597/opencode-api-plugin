@@ -107,6 +107,21 @@ gateway(Node) ──明文 HTTP──► oc2api(:18090) ──uTLS──► zen
 
 ### 构建 oc2api 二进制（`bin/` 被 gitignore，不随仓库分发）
 
+**最快路径：下载 Release 资产**（`.github/workflows/oc2api-release.yml` 从上游 tag 编译并发布）：
+
+```powershell
+New-Item -ItemType Directory -Force bin | Out-Null
+Invoke-WebRequest -Uri "https://github.com/EDDY597/opencode-api-plugin/releases/download/oc2api-v4.4.0/oc2api.exe" -OutFile bin\oc2api.exe
+Get-FileHash bin\oc2api.exe   # 与 Release 正文里的 sha256 对照
+```
+
+Release 正文由 workflow 生成，标签是 `oc2api-<上游 tag>`；要换上游版本就
+**Actions → oc2api-release → Run workflow** 填新的 `upstream_tag`，或者推一个
+`oc2api-vX.Y.Z` 标签。workflow 在发布前会自己跑一次 `/health` + `/models` 冒烟
+（不花额度），所以资产不会是"能编译但起不来"的包。
+
+**本地从源码构建**（没网盘、想改代码、或上游还没发 Release 时）：
+
 ```powershell
 # 一次性：装 Go 1.24+（https://go.dev/dl/ 的 go<ver>.windows-amd64.zip，解压即用，无需管理员）
 $env:GOPROXY = 'https://goproxy.cn,direct'
@@ -117,6 +132,27 @@ Copy-Item E:\Agent\tools\oc2api\oc2api.exe .\bin\oc2api.exe
 ```
 
 换机器、或上游更新后重跑这几行。`OPENCODE_OC2API_PATH` 可指向别的位置。
+
+**两份产物不一样大是正常的**：不加 tag 的本地构建带 mihomo 内核（完整构建），
+`-tags nomihomo` 的瘦身版才约 8 MB、只认 http/socks5 代理。2026-10-30 实测（Go 1.27.3，
+上游 `v4.4.0`）完整构建是 **65.5 MB**；而 2026-10-30 之前本机那份 `bin\oc2api.exe` 只有
+13.4 MB——**上游发布页从来没有二进制资产**（`releases/latest` 只有 tag，没有 assets），
+所以那份也不是下载来的，来源不明，与当前源码构建对不上。Release 一律按"加内核"的完整版
+构建，与 AGENTS.md 里的命令一致。
+
+本机验证脚本（零额度：只打 `/health`、`/models`）：
+
+```powershell
+& "C:\Program Files\nodejs\node.exe" scripts\verify-oc2api-release.mjs           # 静态检查 workflow
+& "C:\Program Files\nodejs\node.exe" scripts\verify-oc2api-release.mjs --build   # 克隆上游 tag、构建、起 18091 冒烟
+```
+
+沙箱里 `C:\Users\<你>\go` 不可写，所以 `--build` 把 `GOCACHE`/`GOMODCACHE`/`GOPATH`/`GOTMPDIR`
+全部指向 `%TEMP%` 下的临时目录；手动跑 `go build` 遇到 `Access is denied` 同理。
+
+`git` 在这台机器上报 `schannel: ... SEC_E_NO_CREDENTIALS` 时，给单条命令加
+`-c http.sslBackend=openssl` 即可（全局配置在 `C:\Program Files\Git\etc\gitconfig`，
+沙箱里改不了）。
 
 ### 额度的计数维度（历史记录，**已被上节取代**）
 
@@ -159,7 +195,9 @@ Retry-After: 64529s -> UTC 2026-10-28 00:00:00
 
 ### 1. 不要删除 `bin\` 下的二进制
 
-`bin/` 在 `.gitignore` 里，删了**无法从 git 恢复**（要么重新构建，要么没了）。
+`bin/` 在 `.gitignore` 里，删了**无法从 git 恢复**（要么重新构建，要么没了）。2026-10-30 起
+`bin\oc2api.exe` 可以从本仓库的 Release（标签 `oc2api-<上游 tag>`）重新下载，`bin\config.json`
+仍然只能靠自己保存或重建。
 
 现在 `bin/` 里有两个关键文件：
 
@@ -422,6 +460,7 @@ foreach ($pt in @(18090,18080)) { netstat -ano | Select-String ":$pt\s" | Select
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/verify-oc2api-chain.ts` | 网关 → oc2api → zen，断言 200（免费链路主回归） |
+| `scripts/verify-oc2api-release.mjs` | 校验 Release workflow；`--build` 还会克隆上游 tag、构建、起 18091 冒烟（零额度） |
 | `scripts/verify-free-http-shim.py` | 起临时 18099 实例测 cli-server 的 http 传输 |
 | `scripts/verify-go-session.ts` | `go/v1` 的 session 头（需 `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY`） |
 | `scripts/measure-http-latency.ts` | 流式 TTFB vs 总耗时 |
@@ -452,7 +491,7 @@ foreach ($pt in @(18090,18080)) { netstat -ano | Select-String ":$pt\s" | Select
 | Node（网关运行用） | `C:\Program Files\nodejs\node.exe`（v26，原生跑 TS） |
 | Node（PATH 上的） | v16.9.1 —— **太老，不能跑 TS** |
 | Go 工具链（构建 oc2api 用） | `E:\Agent\tools\go-install\go\bin\go.exe`（1.27.3，解压版，未进 PATH） |
-| oc2api 源码 / 构建目录 | `E:\Agent\tools\oc2api`；产物在 `bin\oc2api.exe` |
+| oc2api 源码 / 构建目录 | `E:\Agent\tools\oc2api`；产物在 `bin\oc2api.exe`（也可从本仓库 Release `oc2api-v4.4.0` 下载） |
 | opencode CLI | `E:\STUDY\IT\nodejs\node_global\node_modules\opencode-ai\bin\opencode.exe`（1.18.34） |
 | opencode 日志 | `~/.local/share/opencode/log/opencode.log` |
 | 插件位置 | `~/.dsh/profiles/desktop/node_modules/dsh-opencode-gateway`（软链到 `E:\Agent\dsh-opencode-gateway`） |

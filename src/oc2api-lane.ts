@@ -63,8 +63,10 @@ function sleep(ms: number) {
 /**
  * Find the oc2api binary.
  *
- * `bin/` is gitignored, so the binary is built per machine rather than committed;
- * see AGENTS.md for the one-command build. OPENCODE_OC2API_PATH overrides the
+ * `bin/` is gitignored, so the binary is built per machine rather than committed.
+ * Two ways to get one: download the release asset (workflow
+ * `.github/workflows/oc2api-release.yml` publishes `oc2api-<upstream tag>`), or
+ * build from source (see AGENTS.md). OPENCODE_OC2API_PATH overrides the
  * location for a machine that keeps it elsewhere.
  */
 function resolveBinary(root: string): string {
