@@ -128,8 +128,17 @@ server.listen(port, hostname, () => {
   // to be up first. `lanes` in gateway.config.json decides what runs:
   //
   //   lanes.oc2api     { enabled, port, apiKey }  — bin/oc2api.exe, uTLS to zen
-  //   lanes.cliServer  { enabled, port }          — src/cli-server.ts, the 18080 shim
+  //   lanes.cliServer  { enabled, port, apiKey? } — src/cli-server.ts, the 18080 shim
   //                                                 the DSH plugin expects
+  //
+  // Both default to "only when asked". oc2api used to be `enabled !== false`, which made a
+  // config without a `lanes` block try to start a network service and then fail on the
+  // missing key — a confusing half-start rather than a decision. It also let the key get
+  // out of sync with the `free-oc2api` upstream's `apiKey`, and oc2api answers 401 to every
+  // request when they differ, so it is now inherited from that upstream unless overridden.
+  //
+  // The cliServer lane is the one that decides whether an unauthenticated port exists at
+  // all, so it never starts implicitly.
   //
   // Node cannot reach zen for free models at all (TLS fingerprint, measured 2026-10-28),
   // so a cliServer lane with no oc2api behind it can only fail; it is started anyway when
@@ -141,19 +150,57 @@ server.listen(port, hostname, () => {
   const oc2apiPort = Number(oc2api.port ?? 18090)
   const oc2apiBase = `http://127.0.0.1:${oc2apiPort}/v1`
   const shimPort = Number(cliLane.port ?? 18080)
+
+  // The upstream that talks to this lane. Its apiKey is what oc2api must accept, so the
+  // lane uses the same value unless it is spelled out separately. The lookup is local,
+  // case-insensitive and does not depend on whether that upstream is enabled: a config
+  // that disables `free-oc2api` still keeps its key, and 18080 can forward to the lane.
+  const portSuffix = `:${oc2apiPort}/v1`
+  const matchLaneUpstream = (u: any) => {
+    const base = String(u?.baseURL ?? "").replace(/\/+$/, "").toLowerCase()
+    return String(u?.id ?? "").toLowerCase() === "free-oc2api" || base.endsWith(portSuffix.toLowerCase())
+  }
+  const freeUpstream: any =
+    (fileConfig.upstreams ?? []).find((u: any) => String(u?.id ?? "").toLowerCase() === "free-oc2api") ??
+    (fileConfig.upstreams ?? []).find(matchLaneUpstream)
+  const oc2apiEnabled = oc2api.enabled === true
+  const oc2apiKey = String(oc2api.apiKey ?? freeUpstream?.apiKey ?? "")
+  const shimKey = String(cliLane.apiKey ?? oc2apiKey)
+
+  // The gateway's own `free` upstream has to send the same key oc2api expects, or every
+  // request 401s. Check before the lane is up, so the message names the config instead of
+  // surfacing as an upstream auth error.
+  if (oc2apiEnabled && freeUpstream && String(freeUpstream.apiKey ?? "") !== oc2apiKey) {
+    console.warn(
+      `[Gateway] ${freeUpstream.id}.apiKey does not match lanes.oc2api.apiKey; requests through that upstream will 401. `
+      + 'Set them to the same value (or drop one and inherit).',
+    )
+  }
+
   const laneLogger = {
     info: (message: string) => console.log(message),
     warn: (message: string) => console.warn(message),
   }
-  const oc2apiOptions = { root: ROOT, port: oc2apiPort, apiKey: String(oc2api.apiKey ?? ""), logger: laneLogger }
+  const oc2apiOptions = { root: ROOT, port: oc2apiPort, apiKey: oc2apiKey, logger: laneLogger }
   const shimOptions = {
     httpBase: oc2apiBase,
-    apiKey: oc2api.apiKey ? String(oc2api.apiKey) : undefined,
+    apiKey: oc2apiKey || undefined,
   }
 
   void (async () => {
-    if (oc2api.enabled !== false) await startOc2apiLane(oc2apiOptions)
-    if (cliLane.enabled === true) await startFreeLane(ROOT, shimPort, laneLogger, shimOptions)
+    if (oc2apiEnabled) await startOc2apiLane(oc2apiOptions)
+    if (cliLane.enabled === true) {
+      // Forwarding into a lane that is not up cannot answer, and an unkeyed shim would be
+      // an open port on 18080. Both are configuration errors worth refusing loudly.
+      if (!oc2apiEnabled || !shimKey) {
+        laneLogger.warn(
+          `[Gateway] lanes.cliServer is enabled but ${!oc2apiEnabled ? "lanes.oc2api is not" : "neither lanes.cliServer.apiKey nor lanes.oc2api.apiKey is set"}`
+          + '; not starting the 18080 shim.',
+        )
+      } else {
+        await startFreeLane(ROOT, shimPort, laneLogger, shimOptions, shimKey)
+      }
+    }
 
     // The DSH plugin judges the free route once, when it loads, and its 60s refresh
     // loop only refreshes the model *listing* -- it does not rebuild the runtime. So a
@@ -161,7 +208,7 @@ server.listen(port, hostname, () => {
     // restart DSH. Keep both lanes answering instead; the probes are loopback-only and
     // spend no quota.
     const targets: LaneTarget[] = []
-    if (oc2api.enabled !== false) {
+    if (oc2apiEnabled) {
       targets.push({
         name: `oc2api :${oc2apiPort}`,
         check: () => loopbackHealthy(`http://127.0.0.1:${oc2apiPort}/health`),
@@ -171,13 +218,13 @@ server.listen(port, hostname, () => {
         },
       })
     }
-    if (cliLane.enabled === true) {
+    if (cliLane.enabled === true && oc2apiEnabled && shimKey) {
       targets.push({
         name: `free shim :${shimPort}`,
         check: () => loopbackHealthy(`http://127.0.0.1:${shimPort}/healthz`),
         restart: async () => {
           stopFreeLane()
-          await startFreeLane(ROOT, shimPort, laneLogger, shimOptions)
+          await startFreeLane(ROOT, shimPort, laneLogger, shimOptions, shimKey)
         },
       })
     }

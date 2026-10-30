@@ -85,6 +85,33 @@ curl http://127.0.0.1:8787/v1/models
 
 > **空 token 的安全约束**：`token` 为空时，任何能连到端口的人都等于拥有你的模型额度。因此 `hostname` 不是回环（`127.0.0.1` / `localhost` / `::1`）时会**直接拒绝启动**并报 `TOKEN_REQUIRED`。想监听 `0.0.0.0` 或局域网地址，必须同时设置 `token`。
 
+### `lanes`：网关自己托管的两个本地服务
+
+两者**默认都不启动**，必须显式 `enabled: true`。它们随网关启动、随网关退出（没有独立的开机自启条目）。
+
+| 字段 | 默认 | 说明 |
+|:-----|:-----|:-----|
+| `lanes.oc2api.enabled` | `false` | 拉起 `bin/oc2api.exe`（18090），免费模型的唯一出网通道 |
+| `lanes.oc2api.port` | `18090` | 监听端口；须与 `free-oc2api` 上游的 `baseURL` 一致 |
+| `lanes.oc2api.apiKey` | (必填) | 空则拒绝启动（oc2api 监听 `0.0.0.0`，空 key 等于匿名）。省略时从 `free-oc2api` 上游的 `apiKey` 继承；两者不一致会 401，启动日志会点名 |
+| `lanes.cliServer.enabled` | `false` | 拉起 `src/cli-server.ts`（18080），转发到 oc2api。**只有 DSH 插件需要** |
+| `lanes.cliServer.port` | `18080` | 插件默认 `free.serviceUrl` 就是这个端口 |
+| `lanes.cliServer.apiKey` | 同 `lanes.oc2api.apiKey` | 18080 的 Bearer 鉴权。**为空就不启动**（否则是一个谁都能用的开放端口）。若插件读不到 `bin/config.json`，把这个值同时写进 `~/.dsh/.env` 的 `OPENCODE2API_SERVER_KEY` |
+
+最小免费档配置（自己用网关、不接 DSH 插件）：
+
+```json
+{
+  "lanes": { "oc2api": { "enabled": true, "apiKey": "<随机 64 位 hex>" } },
+  "upstreams": [
+    { "id": "free-oc2api", "type": "openai", "prefix": "free",
+      "baseURL": "http://127.0.0.1:18090/v1", "apiKey": "<同一个值>", "enabled": true }
+  ]
+}
+```
+
+`gateway.config.example.json` 里有完整版本（含 `lanes` 注释、`free-oc2api` 与已标注为 legacy 的 `free-cli`）。
+
 `upstreams[]` 字段：
 
 | 字段 | 说明 |
@@ -235,6 +262,10 @@ OpenCode Go 预设内置了一批 Responses 模型映射（grok-4.x 等）。
 
 把 `opencode run` 当成后端进程驱动，对外暴露 OpenAI 兼容接口，网关和 DSH 插件都能接入：
 
+> **2026-10-30 更新**：下面这套是**旧方案**。现在免费档的推荐路线是 `bin\oc2api.exe`
+> （uTLS）+ `free-oc2api` 上游，见「配置参考 → `lanes`」。宿主机能跑 oc2api 时，
+> `cli-server` 只作为 DSH 插件用的 18080 转发垫片存在（`lanes.cliServer`），由网关托管。
+
 ```
 DSH 插件 ─────────────────────────────┐
                                       ├──► cli-server :18080 ──► opencode run ──► 免费模型
@@ -266,11 +297,18 @@ install-cli-autostart.cmd remove   # 取消
 
 #### 鉴权约定
 
-插件从 `bin/config.json` 读 `server_keys[0]`，作为 Bearer token 发给 18080。因此 `cli-server` 用 `--config bin/config.json` 复用同一份 key：
+> 2026-10-30 起，**网关托管的 18080 不再读 `bin/config.json`**：key 由 `lanes.cliServer.apiKey`（省略则用 `lanes.oc2api.apiKey`）传入，没有 key 时这条 lane 直接拒绝启动。以下只适用于手工 `start-cli-server.cmd`。
+
+手工启动时用 `--config bin/config.json` 复用同一份 key：
 
 - `start-cli-server.cmd` 已自动带上 `--config "%~dp0bin\config.json"`
-- 无 key 调用返回 `401 {"error":{"message":"invalid local API key","type":"authentication_error"}}`，与 opencode2api 的错误体一致
+- 无 key 调用返回 `401 {"error":{"message":"invalid local API key","type":"authentication_error"}}`
 - `/healthz`、`/health`、`/v1/health` 不校验 key（供探活）
+
+DSH 插件（`dsh-opencode-gateway` ≥0.2.1，`free.mode: "service"`）的取值顺序是
+`env[OPENCODE2API_SERVER_KEY] ?? bin/config.json 的 server_keys[0]`，而那里的 `bin/config.json`
+是按**插件安装位置**推出的 `<包根>/../opencode-api-plugin/bin/config.json`，不一定是你正在跑的
+checkout。插件与网关不在同一棵树里时，用 `OPENCODE2API_SERVER_KEY` 钉死同一个 key。
 
 已验证能力：
 

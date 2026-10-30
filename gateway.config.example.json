@@ -3,6 +3,21 @@
   "port": 8787,
   "_token_note": "Empty means no auth: /v1 accepts requests without a header. Only allowed while hostname is loopback; the gateway refuses to start otherwise.",
   "token": "",
+  "_lanes_note": "Both lanes are spawned by the gateway and share its lifetime, and BOTH DEFAULT TO OFF: nothing starts unless `enabled` is true. oc2api is the only way to reach the free tier (Node's TLS fingerprint is rejected), and oc2api refuses to start without apiKey (it binds 0.0.0.0 and treats an empty key as anonymous), so generate one: [Convert]::ToHexString((1..16 | % { Get-Random -Max 256 })). To disagree is to 401: lanes.oc2api.apiKey, the free-oc2api upstream's apiKey and (if used) OPENCODE2API_SERVER_KEY in ~/.dsh/.env must all be the same string.",
+  "lanes": {
+    "oc2api": {
+      "enabled": false,
+      "port": 18090,
+      "_apiKey_note": "Required. Empty = the lane refuses to start. Must equal the free-oc2api upstream's apiKey below.",
+      "apiKey": "REPLACE_WITH_A_RANDOM_KEY"
+    },
+    "cliServer": {
+      "enabled": false,
+      "port": 18080,
+      "_note": "Only needed for the DSH plugin (dsh-opencode-gateway >=0.2.1, free.mode 'service'), which looks for the free provider at 127.0.0.1:18080. It is a buffered adapter: no streaming, no tool calls. Authenticated with cliServer.apiKey, else lanes.oc2api.apiKey. If the plugin lives inside this checkout's tree it can read bin/config.json's server_keys[0] by itself; otherwise export OPENCODE2API_SERVER_KEY=<apiKey> in ~/.dsh/.env.",
+      "apiKey": "REPLACE_WITH_THE_SAME_KEY"
+    }
+  },
   "upstreams": [
     {
       "id": "opencode-go",
@@ -27,11 +42,22 @@
       "enabled": false
     },
     {
-      "id": "free-cli",
-      "name": "OpenCode Free via CLI",
-      "_note": "OpenCode's free tier is gated on the official client, not on an API key: a valid oc_sk_ key still gets FreeUsageLimitError over HTTP, while `opencode run` works with no credentials at all. Start this lane with start-cli-server.cmd (src/cli-server.ts, default 127.0.0.1:18081).",
+      "id": "free-oc2api",
+      "name": "OpenCode Free (oc2api)",
+      "_note": "Recommended free path: plain pass-through to the local oc2api lane, so tools and real streaming survive. Requires lanes.oc2api.enabled + apiKey + bin/oc2api.exe (release asset `oc2api-<upstream tag>` or a local build). apiKey must be the same as lanes.oc2api.apiKey, otherwise every request 401s.",
       "type": "openai",
       "prefix": "free",
+      "baseURL": "http://127.0.0.1:18090/v1",
+      "apiKey": "REPLACE_WITH_A_RANDOM_KEY",
+      "protocol": "openai",
+      "enabled": false
+    },
+    {
+      "id": "free-cli",
+      "name": "OpenCode Free via CLI (legacy)",
+      "_note": "Legacy: drives `opencode run` instead of oc2api. Slow (8-30s), buffered, and it drops tool calls. Kept for a machine that cannot run oc2api. Start it by hand with start-cli-server.cmd (src/cli-server.ts, default 127.0.0.1:18081); do not enable it next to free-oc2api on the same `free` prefix - the first enabled one wins and the other is dead weight.",
+      "type": "openai",
+      "prefix": "free-cli",
       "baseURL": "http://127.0.0.1:18081/v1",
       "apiKey": "unused",
       "protocol": "openai",

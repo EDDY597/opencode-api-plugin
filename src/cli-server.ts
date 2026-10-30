@@ -28,13 +28,19 @@ import { servePrompt, stopServe, serveBaseUrl, quotaBlocked, tripQuotaBreaker, t
  * enforced, this transport is supposed to fail loudly rather than route around them.
  *
  *   node src/cli-server.ts [--port 18080] [--transport http|cli]
+ *     [--config bin\config.json | --api-key K] [--parent-pid N]
+ *
+ * `--parent-pid` is set by the gateway that spawns the shim: requests stop being served
+ * once that process is gone, so a restarted gateway can always take the port back.
  */
 
 type Options = CliBackendOptions & {
   port: number
   hostname: string
-  /** Keys a client may present. Empty means no auth (loopback only). */
+  /** Keys a client may present. Empty disables auth, which the spawned shim refuses. */
   apiKeys: string[]
+  /** PID of the gateway that spawned us (0 = none): a dead parent makes us stand down. */
+  parentPid: number
   /** `http` forwards to zen/v1; `cli` drives the opencode binary. */
   transport: "http" | "cli"
   /** zen/v1 base for the http transport. */
@@ -56,10 +62,13 @@ type Options = CliBackendOptions & {
 /**
  * Read the accepted keys from a service config.
  *
- * The DSH plugin reads `server_keys[0]` out of `bin/config.json` and sends it on every
- * request, so this service has to accept exactly those keys or every call comes back 401
- * "invalid local API key". Reusing the same file keeps the two in sync with no extra
- * configuration.
+ * The DSH plugin (>=0.2.1, `mode: "service"`) looks the service's key up as
+ * `process.env[serviceApiKeyEnv] ?? server_keys[0]` of this very file — resolved from
+ * `free.serviceConfigPath`, else `<packageRoot>/../opencode-api-plugin/bin/config.json`,
+ * **not** necessarily this checkout's bin/. So the file is not a contract any more: the
+ * gateway now passes `--api-key` from `lanes.cliServer.apiKey` (falling back to
+ * `lanes.oc2api.apiKey`), and `--config` stays for a hand-started instance that copies the
+ * plugin's own key. Whatever the source, an empty list must never reach the shared port.
  */
 function readServerKeys(configPath: string | undefined): string[] {
   if (!configPath) return []
@@ -88,6 +97,7 @@ function parseArgs(argv: string[]): Options {
     dataHome: process.env.OPENCODE_CLI_DATA_HOME,
     cwd: process.env.OPENCODE_CLI_CWD,
     apiKeys: [],
+    parentPid: 0,
     transport: (process.env.OPENCODE_CLI_TRANSPORT as "http" | "cli") ?? "http",
     httpBaseUrl: process.env.OPENCODE_CLI_HTTP_BASE ?? "https://opencode.ai/zen/v1",
     httpKey: process.env.OPENCODE_CLI_HTTP_KEY ?? "public",
@@ -110,6 +120,7 @@ function parseArgs(argv: string[]): Options {
     else if (arg === "--no-auto") opts.autoApprove = false
     else if (arg === "--config") opts.apiKeys = readServerKeys(next())
     else if (arg === "--api-key") opts.apiKeys.push(next())
+    else if (arg === "--parent-pid") opts.parentPid = Number(next())
     else if (arg === "--serve-port") opts.servePort = Number(next())
     else if (arg === "--no-serve") opts.useServe = false
     else if (arg === "--no-fallback") opts.allowFallback = false
@@ -662,7 +673,14 @@ async function handleCompletion(body: any, res: any) {
   }
 }
 
-/** True when the request carries an accepted key (or auth is disabled). */
+/**
+ * True when the request carries an accepted key (or auth is disabled).
+ *
+ * An empty `accepted` list means "accept anything". That is only safe for a diagnostic
+ * instance on a hand-picked port; the shared 18080 shim must never run that way, because
+ * every local process can reach it and spend the machine's free quota. `standalone.ts`
+ * therefore refuses to start the shim without a key.
+ */
 export function isAuthorized(headers: Record<string, any>, accepted: string[]): boolean {
   if (accepted.length === 0) return true
   const bearer = String(headers["authorization"] ?? "").replace(/^Bearer\s+/i, "").trim()
@@ -672,6 +690,16 @@ export function isAuthorized(headers: Record<string, any>, accepted: string[]): 
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${opts.hostname}:${opts.port}`)
+  const isHealth = url.pathname === "/healthz" || url.pathname === "/health" || url.pathname === "/v1/health"
+
+  // Called by the gateway that spawned us (free-lane.ts passes --parent-pid). A restarted
+  // gateway gives up on `stopFreeLane()` when its child is stuck, so without this a stale
+  // shim keeps the port and the next run silently adopts a zombie parent's leftover.
+  if (opts.parentPid && !isHealth && process.ppid !== opts.parentPid) {
+    console.error(`[cli-server] parent ${opts.parentPid} is gone (now ${process.ppid}); exiting so the port is not held by an orphan`)
+    stopServe()
+    process.exit(0)
+  }
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -685,7 +713,6 @@ const server = createServer(async (req, res) => {
 
   // Health probes stay open so a supervisor can decide "is it up" before it has the key;
   // every other route needs one. This mirrors the opencode2api contract the plugin expects.
-  const isHealth = url.pathname === "/healthz" || url.pathname === "/health" || url.pathname === "/v1/health"
   if (!isHealth && !isAuthorized(req.headers as any, opts.apiKeys)) {
     json(res, 401, {
       error: { code: null, message: "invalid local API key", type: "authentication_error" },

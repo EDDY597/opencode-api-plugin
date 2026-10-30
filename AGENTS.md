@@ -204,7 +204,17 @@ Retry-After: 64529s -> UTC 2026-10-28 00:00:00
 | 文件 | 少了会怎样 |
 | --- | --- |
 | `bin\oc2api.exe` | **免费模型全部 429** —— 网关没有 uTLS 出口。`oc2api-lane` 会在启动日志里报 `oc2api binary not found`，把 `lanes.oc2api.enabled` 误判成死配置 |
-| `bin\config.json` | cli-server 拿不到 `server_keys`，**18080 对 DSH 插件变 401**，表现是「免费模型在菜单里但一用就报鉴权错」 |
+| `bin\config.json` | **只影响 DSH 插件（≥0.2.1，`free.mode: "service"`）**：它按 `env[OPENCODE2API_SERVER_KEY] ?? server_keys[0]` 找 key，找不到就 `no opencode2api server key`、free 路由整个不注册。网关自己的 18080 shim 不读它（2026-10-30 起 key 走 `lanes.cliServer.apiKey` → `lanes.oc2api.apiKey`） |
+
+**注意插件读的是哪个 `bin\config.json`**（`lib/index.js:4239` 的 `defaultServicePaths`）：
+`<插件包根>/../opencode-api-plugin/bin/config.json`，即**按插件安装位置推出的同级目录**，
+不一定是你正在跑的这个 checkout。用 `OPENCODE2API_SERVER_KEY` 环境变量可以直接钉死 key，
+也是唯一不受安装位置影响的写法。
+
+旧版本的表格曾写「`bin\config.json` 缺失 → 18080 变 401」。**那条是错的**：经网关启动时
+shim 从来没读过这个文件（`standalone.ts` 不传 `--config`），而 `apiKeys` 为空时
+`cli-server.ts` 是**不鉴权**的。401 只出现在手工 `start-cli-server.cmd --config`、且 key
+与插件发送的不一致时。
 
 `bin\opencode2api.exe` 曾经也是其中之一（插件在 18080 无响应时自己去 spawn 它），但该文件
 在当前部署里**已经不存在**。这没造成问题，因为网关现在总是先起 18080（`lanes.cliServer`）。
@@ -300,9 +310,17 @@ DSH 插件 ──► :18080 ────┘
 ```json
 "lanes": {
   "oc2api":    { "enabled": true, "port": 18090, "apiKey": "<必须设置>" },
-  "cliServer": { "enabled": true, "port": 18080 }
+  "cliServer": { "enabled": true, "port": 18080, "apiKey": "<同 oc2api.apiKey>" }
 }
 ```
+
+**两条 lane 都默认关闭**（`enabled === true` 才启动）。2026-10-30 之前 `oc2api` 是
+`enabled !== false`（默认开），于是没有 `lanes` 节的配置会先尝试起一个网络服务、再因为
+key 为空失败——看起来像"设计好的提醒"，实际是半启动的状态，而且 `lanes.oc2api.apiKey`
+与 `free-oc2api` 上游 `apiKey` 不一致时 oc2api 对每个请求都回 401，只有到请求阶段才暴露。
+现在：**key 从上游继承**（`lanes.oc2api.apiKey ?? free-oc2api.apiKey`），不一致时启动日志
+直接点名；`cliServer` 需要的 key 走 `lanes.cliServer.apiKey ?? lanes.oc2api.apiKey`，
+**没有 key 就不启动 18080**（2026-10-30 之前它是不鉴权的开放端口）。
 
 **顺序是硬约束**：oc2api 必须先就绪，cliServer 才能转发。`standalone.ts` 里用
 `await` 串起来，就是为此。
@@ -338,7 +356,14 @@ DSH 插件 ──► :18080 ────┘
 
 **已验证的链路**：
 - 网关 `free/glm-5.3-flash-free` → 200 / 1.3s
-- 18080 shim（带 `server_keys[0]`）→ 200 / 2.3–3.0s，模型列表跟随 oc2api（9 个）
+- 18080 shim（带 key）→ 200 / 2.3–3.0s，模型列表跟随 oc2api（**8 个**；旧文档写的 9 个是过期的，
+  `nemotron-3-ultra-free` 早已下架）
+
+**18080 shim 的鉴权（2026-10-30 修）**：以前 `standalone.ts` 只传 `httpBase`/`apiKey`，不传
+`--config`，于是 `cli-server` 的 `apiKeys` 是空数组，而空数组的含义是**不鉴权**——本机任何
+进程都能经 18080 白嫖免费额度。现在 `free-lane.ts` 用 `--api-key <lanes.cliServer.apiKey ?? lanes.oc2api.apiKey>`
+启动，没 key 就不起；同时传 `--parent-pid`，父进程消失后 shim 拒绝继续服务（只放行 `/healthz`），
+防止网关重启时 `stopFreeLane()` 杀不掉、下一代默默采纳上一代的僵尸。
 
 ### 18080 的 cli-server 是**缓冲式适配器**，不是完整 API
 
