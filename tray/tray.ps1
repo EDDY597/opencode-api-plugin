@@ -445,7 +445,7 @@ $script:Monitor.Add_Tick({
       if ($script:Proc -and $script:Proc.HasExited) {
         $script:Monitor.Stop()
         Stop-ProbeThread
-        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '缃戝叧杩涚▼宸查€€鍑猴紝鎵樼洏闅忎箣鍏抽棴', [System.Windows.Forms.ToolTipIcon]::Warning)
+        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '网关进程已退出，托盘随之关闭', [System.Windows.Forms.ToolTipIcon]::Warning)
         $script:QuitTimer = New-Object System.Windows.Forms.Timer
         $script:QuitTimer.Interval = 1200
         $script:QuitTimer.Add_Tick({ $script:QuitTimer.Stop(); Quit-All $false })
@@ -454,10 +454,10 @@ $script:Monitor.Add_Tick({
       }
       Update-Tray
       if (-not $script:State.Healthy -and -not $script:Proc -and $script:State.Streak -ge 2) {
-        # Attached external gateway is gone 鈥 keep icon presence in sync.
+        # Attached external gateway is gone - keep icon presence in sync.
         $script:Monitor.Stop()
         Stop-ProbeThread
-        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '缃戝叧宸插仠姝.{0}', [System.Windows.Forms.ToolTipIcon]::Warning)
+        $script:Notify.ShowBalloonTip(4000, 'LLM Gateway', '网关已停止。{0}', [System.Windows.Forms.ToolTipIcon]::Warning)
         $script:QuitTimer = New-Object System.Windows.Forms.Timer
         $script:QuitTimer.Interval = 1200
         $script:QuitTimer.Add_Tick({ $script:QuitTimer.Stop(); Quit-All $false })

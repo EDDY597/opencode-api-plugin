@@ -294,13 +294,20 @@ Start-Process」一样会炸。
 
 ```powershell
 # A) 在 PowerShell 里：先把每个大小写变体收敛成一个并重建环境块（tray/tray.ps1 用的就是这条）
-foreach ($upper in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY') {
+#    2026-10-30 实测：SetEnvironmentVariable 删一个键时只会删掉**当前存储的那个拼写**，
+#    另一个大小写变体仍在，所以必须循环到「按拼写逐个删干净」。判断「还有没有剩余」
+#    不能用 GetEnvironmentVariable（大小写不敏感，永远能看到另一个变体），要枚举 Keys
+#    做精确比较（-ceq），且删的是**枚举出来的那个键**、不是指定的拼写。
+foreach ($name in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY') {
+  $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+  if ($name -eq 'NO_PROXY' -and $value) { $value = $value + ',opencode.ai,api.deepseek.com' }
   for ($i = 0; $i -lt 4; $i++) {
-    if (-not ([Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -eq $upper })) { break }
-    [Environment]::SetEnvironmentVariable($upper.ToLower(), $null, 'Process')
+    $variant = [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -ceq $name.ToLower() }
+    if (-not $variant) { $variant = [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -ceq $name } }
+    if (-not $variant) { break }
+    [Environment]::SetEnvironmentVariable($variant, $null, 'Process')
   }
-  $v = [Environment]::GetEnvironmentVariable($upper, 'User')
-  if ($v) { [Environment]::SetEnvironmentVariable($upper, $v, 'Process') }
+  if ($value) { [Environment]::SetEnvironmentVariable($name, $value, 'Process') }
 }
 
 # B) 完全绕开 PowerShell 的 Start-Process，用 .NET 自己起（重定向照样可用）
@@ -346,8 +353,10 @@ $text = [System.IO.File]::ReadAllText($p, (New-Object System.Text.UTF8Encoding($
 [System.IO.File]::WriteAllText($p, $text, (New-Object System.Text.UTF8Encoding($true)))
 ```
 
-顺带：`tray.ps1` 第 445、457 行的气泡提示文字**已经是乱码**（`缃戝叧杩涚▼宸查€€鍑猴紝…`），
-是历史上被 GBK 破坏留下的，不影响功能；改到那两行时顺手修掉即可。
+顺带：`tray.ps1` 第 448、460 行的气泡提示文字**曾经**是乱码（`缃戝叧杩涚▼宸查€€鍑猴紝…`），
+是历史上被 GBK 破坏留下的，不影响功能；2026-10-30 已按 UTF-8+BOM 写回修好（`网关进程已退出，托盘随之关闭` /
+`网关已停止。{0}`），同时修掉第 457 行注释里的 `鈥?` 破折号残留。**以后改到这几行时别改回乱码**：
+`git diff` 里如果出现连串的 `缃戝叧` 之类，就是编码又被破坏了。
 
 `.ps1` 里的语法还要注意 PS 5.1 **不支持 `?.` 和 `??`**（那是 PS 7+）。写成 `?.Message`
 会直接 `Unexpected token` 报错，同理被 `SilentlyContinue` 吞掉就变成「功能静默失效」。
