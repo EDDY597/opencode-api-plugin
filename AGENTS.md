@@ -273,7 +273,86 @@ Unknown: FileSystem.open (...\.local\share\opencode\log\opencode.log)
 
 改用 `cmd /c start`（会创建独立进程树）或 `wscript`（可隐藏窗口）。
 
-### 6. 不要从 agent 会话里启动需要长期存活的服务
+**2026-10-30 补：真正的触发条件是「带 `-RedirectStandardOutput` / `-RedirectStandardError`」。**
+这条规则以前只被记成「`Start-Process` 会崩」，所以有人以为它是偶发的——实际上它每次都崩：
+
+| 调用形态 | 结果 |
+| --- | --- |
+| `Start-Process -FilePath ... -PassThru`（不带重定向） | ✅ 正常，走 shell 执行路径，不复制环境块 |
+| `Start-Process ... -RedirectStandardOutput x -RedirectStandardError y` | ❌ **必崩**，抛 `ArgumentException`：`Item has already been added. Key in dictionary: 'no_proxy' Key being added: 'NO_PROXY'` |
+
+原因是重定向强制 `UseShellExecute=false`，.NET 要把父环境块塞进一个**大小写不敏感**的
+`StringDictionary`，而本机环境块里 `no_proxy` 和 `NO_PROXY`（`http(s)_proxy` 同理）是两条独立
+条目，于是撞键。**`$env:X = ...` 赋值也会制造第二个副本**，所以「先设个代理变量再
+Start-Process」一样会炸。
+
+崩点最阴的地方是：`tray.ps1` 开头有 `$ErrorActionPreference = 'SilentlyContinue'`，
+异常被吞，托盘**静默自杀**（图标一闪就没），`8787` 一个端口都不开，`gateway.*.log` 被
+`Start-Process` 重定向截断成 0 字节——看起来像「什么都没发生」。
+
+三条已验证的绕法：
+
+```powershell
+# A) 在 PowerShell 里：先把每个大小写变体收敛成一个并重建环境块（tray/tray.ps1 用的就是这条）
+foreach ($upper in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY') {
+  for ($i = 0; $i -lt 4; $i++) {
+    if (-not ([Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -eq $upper })) { break }
+    [Environment]::SetEnvironmentVariable($upper.ToLower(), $null, 'Process')
+  }
+  $v = [Environment]::GetEnvironmentVariable($upper, 'User')
+  if ($v) { [Environment]::SetEnvironmentVariable($upper, $v, 'Process') }
+}
+
+# B) 完全绕开 PowerShell 的 Start-Process，用 .NET 自己起（重定向照样可用）
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = 'bin\oc2api.exe'; $psi.UseShellExecute = $false
+$psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+$psi.EnvironmentVariables['PORT'] = '18091'
+[System.Diagnostics.Process]::Start($psi)
+
+# C) 交给 vbs（wscript 直接 shell.Run node，不经过 .NET 字典）
+```
+
+第 5 条只解释了「为什么不能用 `Start-Process` 起服务」，**长驻服务的进程树问题仍然要看第 7 条**。
+
+### 6. 改 `.ps1` 之后必须检查 UTF-8 BOM
+
+本机 PowerShell 是 **5.1**，它读**无 BOM** 的 UTF-8 文件时按系统 ANSI 代码页（GBK/936）解释。
+仓库里的 `.ps1`（`tray/tray.ps1` 等）是 **UTF-8 with BOM** 存的，而 **AI 工具的 `edit` /
+`write` 写文件会丢掉 BOM**，于是：
+
+- 中文注释和字符串全部变乱码（`重启服务` → `閲嶅惎鏈嶅姟`）；
+- 乱码撑破字符串终止符，`Parser::ParseFile` 报出十几处「缺少终止符」「意外的标记」；
+- 脚本一行都执行不了。托盘的表现就是「双击 vbs 没反应」。
+
+2026-10-30 实测：`tray/tray.ps1` 被 `edit` 写成无 BOM（前 3 字节 `23 20 4C` = `# L`）后，
+语法检查报 **11 处错误**，托盘启动即退出。补回 `EF BB BF` 后 0 错误。
+
+改完必须验：
+
+```powershell
+$b = [System.IO.File]::ReadAllBytes((Resolve-Path 'tray\tray.ps1'))
+'{0:X2} {1:X2} {2:X2}' -f $b[0],$b[1],$b[2]      # 必须是 EF BB BF
+$errors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'tray\tray.ps1').Path, [ref]$null, [ref]$errors)
+$errors.Count                                      # 必须是 0
+```
+
+丢了就按原编码写回（**不要**用 `Set-Content -Encoding UTF8`，PS 5.1 与 PS 7 行为不同）：
+
+```powershell
+$p = (Resolve-Path 'tray\tray.ps1').Path
+$text = [System.IO.File]::ReadAllText($p, (New-Object System.Text.UTF8Encoding($false)))
+[System.IO.File]::WriteAllText($p, $text, (New-Object System.Text.UTF8Encoding($true)))
+```
+
+顺带：`tray.ps1` 第 445、457 行的气泡提示文字**已经是乱码**（`缃戝叧杩涚▼宸查€€鍑猴紝…`），
+是历史上被 GBK 破坏留下的，不影响功能；改到那两行时顺手修掉即可。
+
+`.ps1` 里的语法还要注意 PS 5.1 **不支持 `?.` 和 `??`**（那是 PS 7+）。写成 `?.Message`
+会直接 `Unexpected token` 报错，同理被 `SilentlyContinue` 吞掉就变成「功能静默失效」。
+
+### 7. 不要从 agent 会话里启动需要长期存活的服务
 
 agent 的 shell 是 DSH 的子进程，进程链为：
 

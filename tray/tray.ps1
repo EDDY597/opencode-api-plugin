@@ -39,6 +39,44 @@ foreach ($name in 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY') {
   }
 }
 
+# Two host groups answer fine over a direct connection, and routing them through
+# the local proxy only adds a tunnel mihomo can stall on: each stall surfaced as
+# `502 TRANSPORT / Connect Timeout Error` on the go/ route (measured 2026-10-30,
+# 45 failures in two hours while direct connections never failed). Keep them out
+# of the proxy, and collapse the duplicate spellings described below.
+#
+# Windows environment blocks are case-insensitive for lookup yet can still hold
+# both `NO_PROXY` and `no_proxy` (here one pair is injected by the harness and a
+# second is written elsewhere; the same happens for HTTP_PROXY/HTTPS_PROXY).
+# Start-Process copies the block through a case-insensitive dictionary and
+# throws "Item has already been added. Key in dictionary: 'no_proxy'" -- and
+# Start-Process is the only thing in this file that knows how to spawn the
+# gateway. With the exception swallowed by $ErrorActionPreference the tray then
+# closed itself silently and no port ever opened. Collapse every pair into one
+# uppercase key before anything else runs.
+$bypassHosts = @('opencode.ai', 'api.deepseek.com')
+foreach ($upper in 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY') {
+  $raw = @()
+  foreach ($spelling in $upper, $upper.ToLower()) {
+    $value = [Environment]::GetEnvironmentVariable($spelling, 'Process')
+    if ($value) { $raw += $value }
+  }
+  if ($upper -eq 'NO_PROXY') { $raw += ($bypassHosts -join ',') }
+  $merged = @($raw | ForEach-Object { $_ -split ',' }) |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -and $_ -ne '*' } |
+    Select-Object -Unique
+  if ($merged.Count -eq 0) { continue }
+  # SetEnvironmentVariable ignores case, so one call removes exactly one entry;
+  # a leftover pair therefore needs two. Loop until neither spelling is left.
+  for ($i = 0; $i -lt 4; $i++) {
+    $present = [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -eq $upper }
+    if (-not $present) { break }
+    [Environment]::SetEnvironmentVariable($upper.ToLower(), $null, 'Process')
+  }
+  [Environment]::SetEnvironmentVariable($upper, ($merged -join ','), 'Process')
+}
+
 # Probe facts shared with the background thread. The UI thread only reads.
 $script:State = [hashtable]::Synchronized(@{
   Running = $true
