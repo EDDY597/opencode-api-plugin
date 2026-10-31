@@ -181,7 +181,18 @@ server.listen(port, hostname, () => {
     info: (message: string) => console.log(message),
     warn: (message: string) => console.warn(message),
   }
-  const oc2apiOptions = { root: ROOT, port: oc2apiPort, apiKey: oc2apiKey, logger: laneLogger }
+  // `lanes.oc2api.env` reaches oc2api verbatim. That is where its proxy pool lives:
+  // PROXY_SUBSCRIPTION_URL turns a Clash/URI subscription into an in-process node pool
+  // (health-probed, rotated on 429/403/transport failures) without any proxy client on
+  // this machine. Without it oc2api dials directly and `/ip` reports "proxy pool is not
+  // configured". Kept in config so the tray, the Run key and a bare shell all agree.
+  const oc2apiEnv: Record<string, string> = {}
+  for (const [key, value] of Object.entries((oc2api.env ?? {}) as Record<string, unknown>)) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      oc2apiEnv[String(key)] = String(value)
+    }
+  }
+  const oc2apiOptions = { root: ROOT, port: oc2apiPort, apiKey: oc2apiKey, env: oc2apiEnv, logger: laneLogger }
   const shimOptions = {
     httpBase: oc2apiBase,
     apiKey: oc2apiKey || undefined,

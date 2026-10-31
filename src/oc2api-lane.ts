@@ -88,6 +88,14 @@ export type Oc2apiLaneOptions = {
   port?: number
   /** Required: oc2api listens on every interface. */
   apiKey?: string
+  /**
+   * Extra environment for the child, merged over `process.env`. This is how the
+   * oc2api proxy pool is configured (`PROXY_SUBSCRIPTION_URL`, `PROXY_STRATEGY`,
+   * `PROXY_MAX_ATTEMPTS`, `PROXY_*_INTERVAL_SECONDS`): v4.4.0 reads them from its
+   * own environment, so a config file keeps working when the gateway is started
+   * from the tray, a Run key or a shell that has none of them.
+   */
+  env?: Record<string, string>
   logger?: { info?: (message: string) => void; warn?: (message: string) => void }
 }
 
@@ -116,9 +124,19 @@ export async function startOc2apiLane(options: Oc2apiLaneOptions): Promise<void>
     return
   }
 
+  // Values configured for the lane win over the inherited environment: the config
+  // file is the operator's explicit statement, and process.env here can be anything
+  // the launching shell happened to carry. Keys with an empty value are dropped so a
+  // blank `PROXY_SUBSCRIPTION_URL: ""` means "direct", not "empty subscription".
+  const extraEnv: Record<string, string> = {}
+  for (const [key, value] of Object.entries(options.env ?? {})) {
+    if (value === undefined || value === null) continue
+    const text = String(value).trim()
+    if (text) extraEnv[key] = text
+  }
   const child = spawn(binary, [], {
     cwd: path.dirname(binary),
-    env: { ...process.env, PORT: String(port), API_KEY: options.apiKey },
+    env: { ...process.env, ...extraEnv, PORT: String(port), API_KEY: options.apiKey },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     detached: false,
