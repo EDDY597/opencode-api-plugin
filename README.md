@@ -326,8 +326,42 @@ checkout。插件与网关不在同一棵树里时，用 `OPENCODE2API_SERVER_KE
 2. 必须 spawn 真正的 `opencode.exe`，不要 spawn `.cmd` 垫片 + `shell: true`，否则 stdout 被 cmd.exe 干扰导致 NDJSON 流卡死（实测挂 180s）。
 3. `stdio[0]` 要设为 `ignore`，否则 CLI 可能等待 stdin。
 4. CLI 把上游故障伪装成正常回复文本（如 `Unexpected server error. Check server logs for details.`，退出码 0）。适配器已把它归类为失败并返回非 200，避免假成功。
+### 免费档的出口 IP：谁在变、谁不变
 
-### 旧方案一：Go 版 opencode2api（失败）
+免费额度按**出口 IP** 计量，所以「要不要 / 能不能换 IP」是个高频问题。先把现在这条链路的答案写清楚：
+
+| 环节 | 走哪个出口 | 会不会变 |
+| --- | --- | --- |
+| `oc2api` → zen（`free/` 路由） | **本机公网 IP 直连** | **不变**。它用 `net.Dialer` 直连，只有一个 dialer，没有出口池，也**不读** `HTTP_PROXY`/`HTTPS_PROXY` |
+| 网关 → zen/go（`go/` 路由） | 按 `HTTPS_PROXY` | 跟着代理走（本机是 `127.0.0.1:7897`） |
+
+核对方法（**不花额度**，查的是外部 IP 服务而不是 zen）：
+
+```powershell
+$key = (Get-Content gateway.config.json -Raw | ConvertFrom-Json).lanes.oc2api.apiKey
+Invoke-RestMethod http://127.0.0.1:18090/ip -Headers @{ Authorization = "Bearer $key" }
+```
+
+返回的 `ip` 就是本机免费档真正在用的出口。**Clash Verge / 7897 对它没有影响**：把代理端口换成别的、把 Clash 关掉，这个 `ip` 都不会变。
+所以「换个 Clash 节点来绕 429」对免费档是无效操作——`429` 来自上游按 IP 记账，换节点并不换 oc2api 的出口。
+
+想真正换出口，只有三种做法：
+
+1. 换机器 / 换网络；
+2. 部署**多个 oc2api 实例**，每个在不同出口，交给上游的聚合网关（CLIProxyAPI / sub2api / new-api 之类）轮询——这是 oc2api 上游 README 里那张图的含义，轮询发生在**实例之间**，不是单个实例内部；
+3. 自建一个中继出口，但当前仓库拉起的 oc2api 版本没有内置代理池，得改成读取并发上传某订阅的构建。
+
+**不要再根据「此前的 opencode2api 支持 `proxies` 出口池」推断 oc2api 也支持**——那是另一个已经退休的服务，见下一节的历史说明。
+
+### 旧方案一：Go 版 opencode2api（失败，本节仅作历史档案）
+
+> **本节是历史档案，别按它理解现在的行为。** 文中说的「出口池 / 多出口轮换」属于下面这个**已被替换**的旧服务
+> （`bin\opencode2api.exe`），不是现在用的 `oc2api`。现在网关拉起的是 `bin\oc2api.exe`（`src/oc2api-lane.ts`）：
+> **只有一个直连出口，没有出口池，不读 `HTTP_PROXY`/`HTTPS_PROXY`。**
+> 判断依据：`GET http://127.0.0.1:18090/ip` 报的就是本机固定出口（2026-10-31 实测 `66.90.98.34`），
+> 而 `NO_PROXY` 里只有 `opencode.ai`——它若走本机代理，这里会显示代理出口。
+> 想真正换出口，只有换机器/换网络，或者部署**多个 oc2api 实例**（每个在不同出口）交给上游网关轮询。
+> 单个 oc2api 不会替你换 IP。出口与额度的关系见「免费档的出口 IP：谁在变、谁不变」。
 
 免费档原本走 `bin\` 下的 [opencode2api](https://github.com/jasonxu114514/opencode2api)（Go，MIT）独立服务。2026-10 起 OpenCode 收紧了免费档的客户端检测：裸 API 调用直接 403 `FreeTierError`（free tier can only be used from within OpenCode），并按出口 IP 统计免费额度，打满后返回 429 `Free usage limit reached` 且间隔性恢复。该服务以完整客户端保真度访问上游——Bun TLS 指纹（uTLS 复刻 ClientHello）、OpenCode 2.1 版本号与 `/inference` 路由、逐字节对齐请求体——并支持多出口轮换、单出口打满后冷却 15 分钟（`free_tier_block_seconds`）、匿名通道（无需任何账号，`anonymous: true`）。
 

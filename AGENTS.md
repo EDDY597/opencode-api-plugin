@@ -101,6 +101,12 @@ gateway(Node) ──明文 HTTP──► oc2api(:18090) ──uTLS──► zen
 本地这一跳没有 TLS，所以不受指纹约束；真正的 TLS 由 oc2api 发出。
 **这条链路已端到端验证**：网关 `free/glm-5.3-flash-free` → 200 / 1.3s。
 
+**oc2api 的出网是单出口、直连**（2026-10-31 复核）：`internal/zen/client.go` 只用一个
+`net.Dialer`，没有出口池、不读 `HTTP_PROXY`。`GET /ip` 实测报 `66.90.98.34`，而 `NO_PROXY`
+只含 `opencode.ai`——它确实没走 7897。所以「换 Clash 节点绕 429」对免费档无效；要换出口只能
+换机器/换网络，或部署多个 oc2api 实例交给上游聚合网关轮询（轮询在实例之间，不在实例内部）。
+README 里「`proxies` 出口池」那套属于已退休的 opencode2api，**不要拿它推断 oc2api**。
+
 **oc2api 必须设 `API_KEY`**：它监听 `0.0.0.0`，且把空 key 当匿名访问。不设等于把这台机器
 的免费额度开放给整个局域网。`gateway.config.json` 里 `lanes.oc2api.apiKey` 与
 `free-oc2api` 上游的 `apiKey` 必须是同一个值。
