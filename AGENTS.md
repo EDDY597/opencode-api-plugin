@@ -532,6 +532,52 @@ oc2api 整个挂掉，那时才需要更新那份静态回退。
 
 ---
 
+## 熔断器（lane 级）
+
+`src/gateway.ts` 的 `breaker*` 一组函数：**连续 3 次配额类失败就暂停这条上游**，
+暂停期内的请求直接拒绝、不触网。设计照抄 opencode2api 的 `anonymous_backoff`。
+
+为什么需要它：重试阶梯只会处理**瞬时** 429。当一条上游当天额度用光（`Retry-After`
+指向下一个 UTC 零点）或指纹不再被接受时，每个请求都要把 3 次重试 + 退避走完才失败，
+客户端白等、网关白烧连接，而且直到下一个零点都不会变好。
+
+| 项 | 值 | 位置 |
+| --- | --- | --- |
+| 触发 | 连续 3 次配额类失败 | `BREAKER_STRIKES` |
+| 暂停 | 5 分钟，每次再触发翻倍，上限 2 小时 | `BREAKER_BASE_MS` / `BREAKER_MAX_MS` |
+| 暂停期响应 | 上游原文 + `retry-after`，`code: UPSTREAM_LANE_PAUSED`，**不触网** | `breakerResponse` |
+| 恢复 | 任意一次成功清零，窗口回到 5 分钟 | `breakerRecord` |
+| 关闭单条上游 | `"breaker": false` | `buildUpstreams` |
+
+**算作配额失败的**：`429`、`402`、以及**看起来像免费层拒绝的 403**
+（`FreeTierError` / `forbidden` / `denied`）。
+
+**不算的**（这几条是重点，写错会让熔断误伤）：
+- `400` / `413` / `422`——请求本身有问题，换个出口也没用，客户端需要真错误；
+- **`403 RegionError` / `not available in your country`**——这是**单个模型**的地区限制
+  （`beam-free` 就是这样），绝不能因此暂停整条 lane，否则所有免费模型一起停摆；
+- `401` 等鉴权错误——走原来的 `isFatalUpstreamError` 立即失败路径。
+
+**状态是内存里的，进程重启即清空。** 这是故意的：重启网关的时候，运维多半正是刚
+处理完底层原因（换订阅、换二进制、等过了零点），不该把上一个进程的「已封禁」判断
+带过来。
+
+**只影响单条上游。** `go/` 路由有独立的 `Upstream` 记录和独立计数，`free/` 被熔断时
+`go/` 照常工作——这也是不做成全局开关的原因。
+
+改这里时至少跑：
+
+```powershell
+& "C:\Program Files\nodejs\node.exe" tests\breaker.test.ts
+```
+
+五个用例分别覆盖：三次开熔断且第 4 次不触网、成功清零、422 永不计数、
+`breaker: false` 退出、RegionError 不暂停。**2026-10-31 就是靠这两个用例抓到了两个真 bug**：
+`buildUpstreams()` 没把 `breaker` 字段搬进规范化对象（开关写了等于没写）、
+以及 RegionError 被算成配额失败（会误伤整条 lane）。
+
+---
+
 ## 验证纪律（这几轮最欠缺的部分）
 
 **改完要跑端到端，但不能拿额度当代价。** 把「端到端」理解成**走到真实边界为止**：

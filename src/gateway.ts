@@ -1284,6 +1284,13 @@ export type UpstreamConfig = {
   // total tries, delays double from 500ms up to `maxDelayMs` (+/- jitter),
   // honoring Retry-After. AUTH/invalid-request failures are never retried.
   retry?: { attempts?: number; maxDelayMs?: number }
+  // Lane circuit breaker for quota-style failures (429 / 402 / a free-tier 403).
+  // Three in a row pause this upstream for 5 minutes, doubling to 2 hours on each
+  // further trip; requests in the window fail fast with the upstream's own wording
+  // and a `retry-after`, without touching the network. A success closes it again,
+  // and client-actionable statuses (400/413/422, and a per-model RegionError) never
+  // count. `false` opts this upstream out; omitted means enabled.
+  breaker?: boolean
   // Time-to-first-byte cap: headers must arrive within this or the attempt
   // fails as TIMEOUT (retryable). Does not limit a started stream. 0 disables.
   timeoutMs?: number
@@ -1331,6 +1338,8 @@ type Upstream = {
   paramFallback: boolean
   retryAttempts: number
   retryMaxDelayMs: number
+  /** `false` disables the lane circuit breaker for this upstream (default: enabled). */
+  breaker?: boolean
   timeoutMs: number
   usageBase?: string
   presetOpenCodeGo: boolean
@@ -1426,6 +1435,9 @@ export function buildUpstreams(config: any = {}): Upstream[] {
       paramFallback: raw.paramFallback !== false,
       retryAttempts: Math.max(1, raw.retry?.attempts ?? DEFAULT_RETRY_ATTEMPTS),
       retryMaxDelayMs: Math.max(0, raw.retry?.maxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS),
+      // Must be forwarded here: runUpstream reads the normalized Upstream, so a raw
+      // `breaker: false` that never lands in this object silently does nothing.
+      breaker: raw.breaker !== false,
       timeoutMs: Math.max(0, raw.timeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS),
       usageBase:
         raw.usage === false
@@ -1862,6 +1874,133 @@ function backoffDelay(attempt: number, maxDelayMs: number): number {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+/**
+ * Lane-level circuit breaker, modelled on opencode2api's `anonymous_backoff`.
+ *
+ * Why a breaker at all: the retry ladder below handles a *transient* 429 fine, but
+ * it has no memory. When an upstream is out of free quota for the rest of the UTC
+ * day — or when its TLS fingerprint stops being accepted — every request pays the
+ * full ladder (three attempts plus backoff) and only then fails. The client waits,
+ * the gateway burns connections, and nothing improves until the next UTC midnight.
+ *
+ * The rule this implements: a burst of consecutive quota-style failures pauses the
+ * whole upstream for a doubling window, and requests during that window fail fast
+ * with the upstream's own wording. It is not triggered by a single 429 (that is
+ * usually another caller briefly filling the bucket, and it does heal), and it is
+ * never triggered by client-actionable statuses (400/413/422) — retrying those
+ * cannot help and the caller needs the real error.
+ *
+ * Deliberately in-memory: a gateway restart should not carry a stale "blocked"
+ * verdict forward, because a restart is exactly when an operator is most likely to
+ * have fixed the underlying cause.
+ */
+type BreakerState = {
+  /** Consecutive quota-style failures since the last success/reset. */
+  strikes: number
+  /** Earliest time the lane may be tried again (ms epoch). 0 = closed. */
+  openUntil: number
+  /** Current backoff duration, doubled on each re-trip. */
+  windowMs: number
+  /** Last upsteam wording, echoed to clients that are refused while open. */
+  lastDetail: string
+  lastStatus: number
+}
+
+/** Threshold and window bounds: three strikes opens for 5 minutes, doubling to 2 h. */
+const BREAKER_STRIKES = 3
+const BREAKER_BASE_MS = 5 * 60_000
+const BREAKER_MAX_MS = 2 * 60 * 60_000
+
+const breakers = new Map<string, BreakerState>()
+
+function breakerFor(id: string): BreakerState {
+  let state = breakers.get(id)
+  if (!state) {
+    state = { strikes: 0, openUntil: 0, windowMs: BREAKER_BASE_MS, lastDetail: "", lastStatus: 0 }
+    breakers.set(id, state)
+  }
+  return state
+}
+
+/** Status codes that mean "this lane cannot serve right now", not "your request is bad". */
+function isQuotaStyleFailure(status: number, text: string): boolean {
+  if (status === 429) return true
+  if (status === 402) return true
+  // 403 covers both FreeTierError (fingerprint) and RegionError (one model only, keyed
+  // by model in the upstream's own wording). A region block must not pause the lane —
+  // the next request may ask for a different model — so it is excluded *first*, and
+  // everything else that looks like a free-tier refusal counts.
+  if (status === 403) {
+    if (/RegionError|not available in your country|地区|region/i.test(text)) return false
+    return /freetier|free tier|free usage|anonymous|forbidden|denied/i.test(text)
+  }
+  return /free usage limit reached|quota exceeded|insufficient_quota/i.test(text)
+}
+
+/** Is the lane currently paused? Returns the state when open, undefined when closed. */
+function breakerPause(upstream: Upstream): BreakerState | undefined {
+  if (upstream.breaker === false) return undefined
+  const state = breakers.get(upstream.id)
+  if (!state || state.openUntil === 0) return undefined
+  if (Date.now() >= state.openUntil) {
+    // Half-open: one request is allowed through. The window is kept so a failure
+    // doubles it, while a success (recorded below) resets everything.
+    state.openUntil = 0
+    return undefined
+  }
+  return state
+}
+
+/** Record an outcome; success resets the lane, a quota failure counts toward opening. */
+function breakerRecord(upstream: Upstream, status: number, text: string) {
+  if (upstream.breaker === false) return
+  const state = breakerFor(upstream.id)
+  if (status < 400) {
+    state.strikes = 0
+    state.windowMs = BREAKER_BASE_MS
+    state.openUntil = 0
+    state.lastDetail = ""
+    state.lastStatus = 0
+    return
+  }
+  if (!isQuotaStyleFailure(status, text)) return
+  state.lastDetail = upstreamErrorDetail(text)
+  state.lastStatus = status
+  state.strikes += 1
+  if (state.strikes >= BREAKER_STRIKES) {
+    state.openUntil = Date.now() + state.windowMs
+    debugLog(`(breaker) ${upstream.id} paused for ${Math.round(state.windowMs / 1000)}s after ${state.strikes} quota failures`)
+    state.windowMs = Math.min(state.windowMs * 2, BREAKER_MAX_MS)
+    state.strikes = 0
+  }
+}
+
+/** The refusal a paused lane returns: the upstream's wording, marked retryable. */
+function breakerResponse(upstream: Upstream, state: BreakerState, model: string): Response {
+  const seconds = Math.max(1, Math.round((state.openUntil - Date.now()) / 1000))
+  const body = JSON.stringify({
+    error: {
+      message: `${state.lastDetail || "upstream temporarily unavailable"} (model ${model}); retry in ${seconds}s`,
+      type: "rate_limit_error",
+      code: "UPSTREAM_LANE_PAUSED",
+      retryable: true,
+    },
+  })
+  return new Response(body, {
+    status: state.lastStatus === 402 ? 402 : 429,
+    headers: { "content-type": "application/json", "retry-after": String(seconds), ...CORS },
+  })
+}
+
+/** Exported for tests: read/clear the breaker table without touching the network. */
+export function breakerState(id?: string): any {
+  if (id === undefined) return Object.fromEntries(breakers)
+  return breakers.get(id)
+}
+export function resetBreakers() {
+  breakers.clear()
+}
+
 /** True when a non-stream chat payload carries no content, tool calls or reasoning. */
 async function emptyChatPayload(response: Response): Promise<boolean> {
   const type = response.headers.get("content-type") ?? ""
@@ -1898,6 +2037,12 @@ function isTimeoutAbort(error: any): boolean {
 }
 
 async function runUpstream(upstream: Upstream, model: string, chatBody: any, stream: boolean, session: string) {
+  // A paused lane is refused before any connection is made: that is the whole point
+  // of the breaker (a lane out of quota for the day must not cost the client the
+  // retry ladder on every request).
+  const paused = breakerPause(upstream)
+  if (paused) return breakerResponse(upstream, paused, model)
+
   const protocol = protocolFor(upstream, model)
   const headers = upstreamHeaders(upstream, session, protocol)
   let pending = applyParamRules({ ...chatBody, model }, upstream, model)
@@ -1961,6 +2106,7 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
         return response
       }
       debugLog(`<-- ${response.status} ok`)
+      breakerRecord(upstream, response.status, "")
       if (!stream || response.body === null) return response
       // The upstream accepted the request, so a later cut is ours to contain
       // instead of letting the client's socket abort mid-body.
@@ -2031,6 +2177,10 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
       // now with the provider's own wording so "key has no balance" is visible
       // immediately instead of surfacing as a client-side timeout.
       debugLog(`<-- ${lastStatus} fatal (not retrying) ${lastText.slice(0, 400)}`)
+      // A fatal account/quota rejection is exactly what the breaker exists for: it
+      // will still be true on the next request, so count it and let the lane pause
+      // once enough of them land in a row.
+      breakerRecord(upstream, lastStatus, lastText)
       return new Response(
         JSON.stringify({
           error: {
@@ -2059,6 +2209,7 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
     // upstream's own 422 told clients the request was malformed, which is both
     // wrong and untreatable; a 503 with a retryable code lets them back off and
     // try again (or switch models) instead of blaming the payload.
+    breakerRecord(upstream, lastStatus, lastText)
     return new Response(
       JSON.stringify({
         error: {
@@ -2072,6 +2223,10 @@ async function runUpstream(upstream: Upstream, model: string, chatBody: any, str
     )
   }
 
+  // The ladder is exhausted (or the status was not retryable). Record the outcome
+  // before relaying: a quota-style 429/402/FreeTierError here is what eventually
+  // opens the breaker, and a success resets it.
+  breakerRecord(upstream, lastStatus, lastText)
   return new Response(lastText, { status: lastStatus, headers: { "content-type": lastType, ...CORS } })
 }
 

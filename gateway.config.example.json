@@ -50,6 +50,7 @@
       "baseURL": "http://127.0.0.1:18090/v1",
       "apiKey": "REPLACE_WITH_A_RANDOM_KEY",
       "protocol": "openai",
+      "_breaker_note": "breaker (default true) pauses this upstream for 5 minutes after 3 consecutive quota-style failures (429 / 402 / a free-tier 403), doubling to 2 hours on each re-trip; requests in the window fail fast with the upstream's own wording plus retry-after instead of re-walking the retry ladder. Only affects this upstream, never the go/ route. Set \"breaker\": false to keep every request going upstream.",
       "enabled": false
     },
     {

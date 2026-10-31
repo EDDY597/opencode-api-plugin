@@ -28,54 +28,22 @@ $script:ConfigPath = Join-Path $script:Root 'gateway.config.json'
 # Node's fetch ignores HTTP(S)_PROXY unless this is set before the process starts.
 $env:NODE_USE_ENV_PROXY = '1'
 
-# The gateway and its embedded backend only reach their upstreams through the
-# user's proxy (poisoned LAN DNS on this machine). A tray launched from a shell
-# without those vars (scheduler, another terminal) would run the whole chain
-# proxy-less, so fall back to the registry user environment.
-foreach ($name in 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY') {
-  if (-not [Environment]::GetEnvironmentVariable($name, 'Process')) {
-    $value = [Environment]::GetEnvironmentVariable($name, 'User')
-    if ($value) { [Environment]::SetEnvironmentVariable($name, $value, 'Process') }
-  }
+# DIRECT, NOT PROXIED (2026-10-31). This block used to copy HTTP(S)_PROXY from the
+# registry user environment because the host's LAN DNS was thought to be poisoned.
+# Measured since: zen/go/v1 answers direct 200 / 1s, every go/ call in
+# gateway-debug.log returned 200 in 2-7s over a direct connection, and a proxy
+# variable only leaked into oc2api's /ip probe -- which then reported the PROXY exit
+# (66.90.98.34) instead of the real egress. Clear the variables for the gateway and
+# everything it spawns so /ip always reports the true direct egress.
+foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy') {
+  [Environment]::SetEnvironmentVariable($name, $null, 'Process')
 }
 
-# Two host groups answer fine over a direct connection, and routing them through
-# the local proxy only adds a tunnel mihomo can stall on: each stall surfaced as
-# `502 TRANSPORT / Connect Timeout Error` on the go/ route (measured 2026-10-30,
-# 45 failures in two hours while direct connections never failed). Keep them out
-# of the proxy, and collapse the duplicate spellings described below.
-#
-# Windows environment blocks are case-insensitive for lookup yet can still hold
-# both `NO_PROXY` and `no_proxy` (here one pair is injected by the harness and a
-# second is written elsewhere; the same happens for HTTP_PROXY/HTTPS_PROXY).
-# Start-Process copies the block through a case-insensitive dictionary and
-# throws "Item has already been added. Key in dictionary: 'no_proxy'" -- and
-# Start-Process is the only thing in this file that knows how to spawn the
-# gateway. With the exception swallowed by $ErrorActionPreference the tray then
-# closed itself silently and no port ever opened. Collapse every pair into one
-# uppercase key before anything else runs.
-$bypassHosts = @('opencode.ai', 'api.deepseek.com')
-foreach ($upper in 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY') {
-  $raw = @()
-  foreach ($spelling in $upper, $upper.ToLower()) {
-    $value = [Environment]::GetEnvironmentVariable($spelling, 'Process')
-    if ($value) { $raw += $value }
-  }
-  if ($upper -eq 'NO_PROXY') { $raw += ($bypassHosts -join ',') }
-  $merged = @($raw | ForEach-Object { $_ -split ',' }) |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and $_ -ne '*' } |
-    Select-Object -Unique
-  if ($merged.Count -eq 0) { continue }
-  # SetEnvironmentVariable ignores case, so one call removes exactly one entry;
-  # a leftover pair therefore needs two. Loop until neither spelling is left.
-  for ($i = 0; $i -lt 4; $i++) {
-    $present = [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -eq $upper }
-    if (-not $present) { break }
-    [Environment]::SetEnvironmentVariable($upper.ToLower(), $null, 'Process')
-  }
-  [Environment]::SetEnvironmentVariable($upper, ($merged -join ','), 'Process')
-}
+# The duplicate-spelling merge that used to live here is gone with the proxy vars:
+# with every spelling cleared above there is nothing left to collapse, and no
+# Start-Process in this file runs with redirection (the case-insensitive dictionary
+# crash needs one). If a proxy ever comes back, restore NOTHING here before reading
+# the "Start-Process" entry in AGENTS.md.
 
 # Probe facts shared with the background thread. The UI thread only reads.
 $script:State = [hashtable]::Synchronized(@{
