@@ -141,10 +141,40 @@ Copy-Item E:\Agent\tools\oc2api\oc2api.exe .\bin\oc2api.exe
 
 **两份产物不一样大是正常的**：不加 tag 的本地构建带 mihomo 内核（完整构建），
 `-tags nomihomo` 的瘦身版才约 8 MB、只认 http/socks5 代理。2026-10-30 实测（Go 1.27.3，
-上游 `v4.4.0`）完整构建是 **65.5 MB**；而 2026-10-30 之前本机那份 `bin\oc2api.exe` 只有
-13.4 MB——**上游发布页从来没有二进制资产**（`releases/latest` 只有 tag，没有 assets），
-所以那份也不是下载来的，来源不明，与当前源码构建对不上。Release 一律按"加内核"的完整版
-构建，与 AGENTS.md 里的命令一致。
+上游 `v4.4.0`）完整构建是 **65.5 MB**；Release 上那份是 **57.0 MB**（同一 tag、同一 toolchain，
+体积差的具体成因未逐项拆解——按 build info 确认两者是同一 tag、同一 toolchain，**差别不是版本**）。
+
+**`bin\oc2api.exe` 的来源要看 build info，别猜体积。** 2026-10-30 我按体积误判过一次
+「13.4 MB、来源不明」——其实是**错**的。用 Go 嵌在二进制里的 build info 就能确定：
+
+```powershell
+$t = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes('bin\oc2api.exe'))
+[regex]::Match($t, 'path\s+oc2api/cmd/oc2api[\s\S]{0,400}').Value   # mod / dep 清单
+```
+
+那份 13.4 MB 的答案是：`mod oc2api v0.0.0-20261027132328-a2c401784ec6`，即
+**本机 `E:\Agent\tools\oc2api` @ `a2c4017`（2026-10-27 21:23）的自编译产物**，依赖只有
+`utls v1.8.2` + `klauspost/compress` + `andybalholm/brotli`——**没有 mihomo**，所以小是正常的。
+它从来没有过“第三方来源”的问题。
+
+**2026-10-31 已升级到 Release 的 v4.4.0**：
+
+| 项 | 值 |
+| --- | --- |
+| 当前 `bin\oc2api.exe` | 57,028,608 字节，sha256 `6d8979cba34fd6b0bc2c4bb593eef685ee0779fd8879c90b00610dc0bf2efe53` |
+| 旧文件备份 | `bin\oc2api.exe.a2c4017.20261031-093949.bak`（13,402,624 字节，sha256 `34F0C85D…C21C`） |
+| 回滚 | 把 `.bak` 改回 `oc2api.exe`，重启网关 |
+
+升级**没有改变出网方式**：`GET /ip` 仍报 `direct: 66.90.98.34`，`proxy: "proxy pool is not configured"`——
+v4.4.0 有代理池能力但没配置，所以还是单出口直连（详见「oc2api 的出网是单出口、直连」）。
+验证用的是零额度接口：`/health`、`/models`（带对 key 200、带 `bin/config.json` 的旧 key 401、无 key 401）、
+网关 `/v1/models` 里 `free/` 是 8 个。
+
+**升级时的进程约束**：`bin\oc2api.exe` 正在被网关的 lane 运行，Windows 会锁住映像文件，
+直接 `Copy-Item -Force` 会失败。正确顺序是：停网关进程树（托盘会跟着退出，这是设计行为）→
+替换文件 → 用 `cmd /c start` 拉起网关 → 托盘会经 Run 键自启并接管已在跑的 8787，不会重复拉进程。
+**不要用 PowerShell 的 `ProcessStartInfo` + 重定向去拉网关**——那会撞上 `NO_PROXY`/`no_proxy`
+字典键，进程起不来（见「不可做的事」第 5 条）。
 
 本机验证脚本（零额度：只打 `/health`、`/models`）：
 
@@ -610,7 +640,7 @@ foreach ($pt in @(18090,18080)) { netstat -ano | Select-String ":$pt\s" | Select
 | Node（网关运行用） | `C:\Program Files\nodejs\node.exe`（v26，原生跑 TS） |
 | Node（PATH 上的） | v16.9.1 —— **太老，不能跑 TS** |
 | Go 工具链（构建 oc2api 用） | `E:\Agent\tools\go-install\go\bin\go.exe`（1.27.3，解压版，未进 PATH） |
-| oc2api 源码 / 构建目录 | `E:\Agent\tools\oc2api`；产物在 `bin\oc2api.exe`（也可从本仓库 Release `oc2api-v4.4.0` 下载） |
+| oc2api 源码 / 构建目录 | `E:\Agent\tools\oc2api`（本机 checkout 停在 `a2c4017`）；**运行中的 `bin\oc2api.exe` 是 Release `v4.4.0`**（见「构建 oc2api」里的 sha256 与备份名） |
 | opencode CLI | `E:\STUDY\IT\nodejs\node_global\node_modules\opencode-ai\bin\opencode.exe`（1.18.34） |
 | opencode 日志 | `~/.local/share/opencode/log/opencode.log` |
 | 插件位置 | `~/.dsh/profiles/desktop/node_modules/dsh-opencode-gateway`（软链到 `E:\Agent\dsh-opencode-gateway`） |
