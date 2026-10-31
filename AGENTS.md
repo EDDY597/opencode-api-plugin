@@ -101,11 +101,40 @@ gateway(Node) ──明文 HTTP──► oc2api(:18090) ──uTLS──► zen
 本地这一跳没有 TLS，所以不受指纹约束；真正的 TLS 由 oc2api 发出。
 **这条链路已端到端验证**：网关 `free/glm-5.3-flash-free` → 200 / 1.3s。
 
-**oc2api 的出网是单出口、直连**（2026-10-31 复核）：`internal/zen/client.go` 只用一个
-`net.Dialer`，没有出口池、不读 `HTTP_PROXY`。`GET /ip` 实测报 `66.90.98.34`，而 `NO_PROXY`
-只含 `opencode.ai`——它确实没走 7897。所以「换 Clash 节点绕 429」对免费档无效；要换出口只能
-换机器/换网络，或部署多个 oc2api 实例交给上游聚合网关轮询（轮询在实例之间，不在实例内部）。
-README 里「`proxies` 出口池」那套属于已退休的 opencode2api，**不要拿它推断 oc2api**。
+**oc2api 的出网是单出口直连**（2026-10-31 复测）：它把 zen 请求交给 `internal/zen/client.go`
+里一个 `net.Dialer` + uTLS，**不读 `HTTP_PROXY`**，所以「换个 Clash 节点」对免费档无效——
+要换出口只能换机器/换网络，或部署多个 oc2api 实例交给上游聚合网关轮询（轮询在实例之间，
+不在实例内部）。README 里「`proxies` 出口池」那套属于已退休的 opencode2api，
+**不要拿它推断 oc2api**。
+
+> **出口 IP 会变，别把某一刻的地址当常量。** 2026-10-30 记的是 `66.90.98.34`，
+> 2026-10-31 关掉 Clash Verge 后同一个 `/ip` 报 `112.193.38.210`——那次「直连」其实经
+> Clash 出口。核对当前出口永远用 `GET /ip`，不要照抄历史值。
+
+### v4.4.0 的出口池：能用，但默认别开
+
+v4.4.0 编译时带 mihomo 内核（`internal/proxypool/`），支持把一份 Clash/URI 订阅变成**进程内**
+节点池：健康探测、429/403/传输失败自动换节点、定时重拉订阅。配置走它自己的环境变量
+（`PROXY_SUBSCRIPTION_URL`、`PROXY_STRATEGY`、`PROXY_MAX_ATTEMPTS`、
+`PROXY_SUBSCRIPTION_REFRESH_SECONDS`、`PROXY_HEALTH_INTERVAL_SECONDS`），
+网关通过 `lanes.oc2api.env` 传给它（`src/oc2api-lane.ts` 的 `env` 选项 + `src/standalone.ts`）。
+
+**2026-10-31 实测：在本机这个订阅源上不可用**，原因是两个约束同时成立：
+
+| 拉订阅的路径 | 订阅站的应答 | oc2api 能否接受 |
+| --- | --- | --- |
+| 经 Clash（`66.90.98.34`） | **HTTP 429**（0.7s 就拒） | 否，出口被限流 |
+| 直连（`112.193.38.210`） | 200，但**要 16.1s** | 否，`net/http: TLS handshake timeout` |
+
+而 oc2api **只有一个全局 `HTTP_PROXY`**，做不到「拉订阅走代理、zen 走直连」。
+所以只要订阅站对其中一个出口限流，池子就加载不了。
+
+**这不是 oc2api 的 bug**：把同一份订阅（本地 http 提供）喂给它，`sticky` 和 `round_robin`
+都正常——50 个节点、出口变成节点 IP、`via: proxy`。**换一个不限流、或不按 UA 分流的订阅源
+就能直接用**。
+
+当前部署的选择是**关掉**：`gateway.config.json` 的 `lanes.oc2api` 里没有 `env`，
+`/ip` 报 `proxy pool is not configured`，oc2api 走单出口直连。要重新启用，加回那段 `env` 即可。
 
 **oc2api 必须设 `API_KEY`**：它监听 `0.0.0.0`，且把空 key 当匿名访问。不设等于把这台机器
 的免费额度开放给整个局域网。`gateway.config.json` 里 `lanes.oc2api.apiKey` 与
@@ -165,7 +194,7 @@ $t = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes('bin\oc2api.exe'))
 | 旧文件备份 | `bin\oc2api.exe.a2c4017.20261031-093949.bak`（13,402,624 字节，sha256 `34F0C85D…C21C`） |
 | 回滚 | 把 `.bak` 改回 `oc2api.exe`，重启网关 |
 
-升级**没有改变出网方式**：`GET /ip` 仍报 `direct: 66.90.98.34`，`proxy: "proxy pool is not configured"`——
+升级**没有改变出网方式**：`GET /ip` 仍报单个 `direct` 出口（当时是 `66.90.98.34`，见上一条关于出口会变的提醒），`proxy: "proxy pool is not configured"`——
 v4.4.0 有代理池能力但没配置，所以还是单出口直连（详见「oc2api 的出网是单出口、直连」）。
 验证用的是零额度接口：`/health`、`/models`（带对 key 200、带 `bin/config.json` 的旧 key 401、无 key 401）、
 网关 `/v1/models` 里 `free/` 是 8 个。
@@ -192,17 +221,10 @@ v4.4.0 有代理池能力但没配置，所以还是单出口直连（详见「o
 
 ### 额度的计数维度（历史记录，**已被上节取代**）
 
-下面这张表是 2026-10-27 在「额度耗尽窗口」里做的排除实验。它当时的结论是「与 Key 无关、
-与出口 IP 无关」——**但那一整轮观测其实都发生在 Node 客户端上，而 Node 的 429 是指纹拒绝**，
-所以这些行测的都是同一件事，不是额度的计数维度。**保留此表只为说明当时的推理链错在哪，
-不要再用它推任何结论。**
-
-| IP 出口 | 凭据 | 当时的观测 | 真实含义 |
-| --- | --- | --- | --- |
-| 默认线路 | 有效 `oc_sk_` Key | ❌ 429 | 指纹拒绝 |
-| `95.40.244.5`（代理） | 有效 `oc_sk_` Key | ❌ 429 | 指纹拒绝 |
-| `95.40.215.88`（代理） | 不带 Key | ❌ 429 | 指纹拒绝 |
-| `95.40.244.5`（代理） | 无效 Key | ❌ 429 | 指纹拒绝 |
+2026-10-27 在「额度耗尽窗口」里做过一组排除实验（换出口、换 Key、带不带 Key），当时的结论
+是「与 Key 无关、与出口 IP 无关」。**那一整轮观测全部发生在 Node 客户端上，而 Node 的 429
+是指纹拒绝**，所以四组测的都是同一件事，不构成「额度的计数维度」的证据。原表四行结论完全
+相同，已删除；保留这段只为说明那条推理链错在哪，**不要再用它推任何结论**。
 
 **仍然成立的只有一条**：免费层对 key 不敏感——`Bearer public`、有效 `oc_sk_`、无效 key
 拿到的结果一模一样。这符合「免费额度不挂在账号上」的说法。
@@ -510,7 +532,14 @@ oc2api 整个挂掉，那时才需要更新那份静态回退。
 
 ---
 
-## 性能：CLI 传输为什么必须常驻（仅 `transport=cli` 适用）
+## 备用：CLI 通道（仅当 `lanes.oc2api` 关闭、或指纹被上游识破时）
+
+默认链路是 oc2api（uTLS）。本节只在退回 CLI 通道
+（`OPENCODE_CLI_TRANSPORT=cli`，或 `lanes.oc2api.enabled: false` + 手工起 `start-cli-server.cmd`）时才相关。
+
+**不要拿这里的数字评价现在的免费档**——现在免费调用是 1.3–2.9s，不是这里的 4–5s / 20–30s。
+
+### 为什么要常驻
 
 单次调用耗时实测：
 
@@ -523,28 +552,26 @@ oc2api 整个挂掉，那时才需要更新那份静态回退。
 所以 CLI 后端必须常驻。代价是**服务刚启动后的第一次调用仍需 ~20–30s**（后端冷启动），
 之后稳定在 4–5s。
 
----
-
-## 额度：如何判断，以及不要怎么判断
+### 额度墙怎么判断（CLI 侧特有）
 
 免费额度耗尽时 CLI **不返回错误**，它记录日志后自己重试，HTTP 请求永不返回。
 这会让「额度墙」表现为「网关挂起」。
 
-### 正确做法
+#### 正确做法
 
 1. **熔断器**（`src/opencode-local/serve-backend.ts`）：只在**观察到失败**后打开，
    冷却 5 分钟。打开期间请求立即拒绝，不触网。
 2. **日志仅用于解释**：请求已经失败/超时后，读 CLI 日志把「没有响应」翻译成
    「额度耗尽」。
 
-### 不要做
+#### 不要做
 
 - **不要在发请求前扫日志做预检查。** 日志跨进程共享且含历史，会把**本可成功**的请求
   拦掉。这是真实误判风险，已移除。
 - **不要加后台轮询。** 本模块没有任何定时器，闲置时零消耗。熔断只在用户真发请求时检查。
 - **不要在失败时回退到 one-shot 路径。** 额度墙下那条路只会再花 30s+ 并同样失败。
 
-### 已消除的浪费
+#### 已消除的浪费
 
 CLI 每次创建会话都会额外调一个小模型（`gpt-5.4-nano`）生成标题。实测一上午产生
 **72 次**此类请求，且全部因余额不足而失败。`servePrompt` 显式传 `{ title: "free-lane" }`
@@ -645,7 +672,8 @@ foreach ($pt in @(18090,18080)) { netstat -ano | Select-String ":$pt\s" | Select
 | opencode 日志 | `~/.local/share/opencode/log/opencode.log` |
 | 插件位置 | `~/.dsh/profiles/desktop/node_modules/dsh-opencode-gateway`（软链到 `E:\Agent\dsh-opencode-gateway`） |
 | 插件配置 | `~/.dsh/profiles/desktop/cordis.patch.yml` |
-| 代理 | `http://127.0.0.1:7897`；`NO_PROXY` 含 `opencode.ai` |
+| 代理 | `http://127.0.0.1:7897`（Clash Verge，**可能没在跑**）；`NO_PROXY` 含 `opencode.ai`。**网关不在时**别把死代理变量传给它：死端口的 `HTTPS_PROXY` 会让 oc2api 的 `/ip` 等外部查询 502，而 zen 直连本身没问题（实测 `zen/go` 直连 200 / 1s） |
+| 本机出口 | 跑过 Clash 时是 `66.90.98.34`，Clash 退出后是 `112.193.38.210`。**永远用 `GET /ip` 现查** |
 | 管理员权限 | **不可用**（审批策略为 never），`schtasks /sc onlogon` 会 Access denied |
 
 ---
